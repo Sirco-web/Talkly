@@ -206,6 +206,17 @@ function CallOverlay({ call, onClose, isIncoming }) {
   useEffect(() => {
     if (isIncoming) {
       playTone(880, 'triangle'); // Ringtone
+      // Poll for cancellation by caller
+      pollRef.current = setInterval(async () => {
+        try {
+          const res = await jsonFetch(`/api/calls/${call.id}`);
+          if (res.call.status === 'ended') {
+            clearInterval(pollRef.current);
+            stopTone();
+            onClose();
+          }
+        } catch {}
+      }, 1000);
     } else {
       playTone(425, 'sine'); // Dial tone
       // Poll for acceptance

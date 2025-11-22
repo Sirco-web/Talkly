@@ -432,6 +432,56 @@ app.post("/api/calls", requireAuth, async (req, res) => {
   res.status(201).json({ call });
 });
 
+// NEW: Get pending calls for the current user
+app.get("/api/calls/pending", requireAuth, async (req, res) => {
+  const db = await loadDB();
+  const userId = req.session.userId;
+  // Filter for calls to this user that are 'ringing' and created within last 60s
+  const now = Date.now();
+  const calls = db.calls.filter(
+    (c) =>
+      c.toUserId === userId &&
+      c.status === "ringing" &&
+      now - new Date(c.createdAt).getTime() < 60000
+  );
+  res.json({ calls });
+});
+
+// NEW: Accept a call
+app.post("/api/calls/:id/accept", requireAuth, async (req, res) => {
+  const callId = req.params.id;
+  const db = await loadDB();
+  const call = db.calls.find((c) => c.id === callId);
+  if (!call) return res.status(404).json({ error: "Call not found" });
+  
+  if (call.toUserId !== req.session.userId) {
+    return res.status(403).json({ error: "Not authorized to accept this call" });
+  }
+
+  call.status = "connected";
+  call.updatedAt = new Date().toISOString();
+  await saveDB(db);
+  res.json({ call });
+});
+
+// NEW: Decline/End a call
+app.post("/api/calls/:id/decline", requireAuth, async (req, res) => {
+  const callId = req.params.id;
+  const db = await loadDB();
+  const call = db.calls.find((c) => c.id === callId);
+  if (!call) return res.status(404).json({ error: "Call not found" });
+
+  // Allow caller or callee to end/decline
+  if (call.fromUserId !== req.session.userId && call.toUserId !== req.session.userId) {
+    return res.status(403).json({ error: "Not authorized" });
+  }
+
+  call.status = "ended";
+  call.updatedAt = new Date().toISOString();
+  await saveDB(db);
+  res.json({ call });
+});
+
 // Chat management endpoints: rename, clear messages, delete, set-key in-place, rotate(create new & delete old)
 app.post("/api/chats/:id/rename", requireAuth, async (req, res) => {
   const chatId = req.params.id;

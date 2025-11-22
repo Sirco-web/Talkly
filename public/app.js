@@ -1,5 +1,6 @@
-// app.js - Talky front-end
+// app.js - Talky front-end (GitHub-backed, encrypted chats, call signaling)
 
+// ---------- Element refs ----------
 const authScreen = document.getElementById("auth-screen");
 const mainScreen = document.getElementById("main-screen");
 
@@ -44,11 +45,18 @@ const adminOverlay = document.getElementById("admin-overlay");
 const adminBody = document.getElementById("admin-body");
 const adminClose = document.getElementById("admin-close");
 
+// ---------- State ----------
 let currentUser = null;
 let chats = [];
 let messagesByChat = {};
 let activeChatId = null;
+let isAdminOpen = false;
+let pendingCallPollTimer = null;
 
+// local chat key cache (chatId -> { code })
+let chatKeyCache = {};
+
+// ---------- Utilities ----------
 async function jsonFetch(url, options = {}) {
   const res = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -96,6 +104,123 @@ function switchAuthTab(tab) {
 tabLogin.addEventListener("click", () => switchAuthTab("login"));
 tabSignup.addEventListener("click", () => switchAuthTab("signup"));
 
+// ---------- Chat key helpers (SHA-based code -> AES key) ----------
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+function loadChatKeyCache() {
+  try {
+    const raw = localStorage.getItem("talky_chat_keys");
+    if (!raw) {
+      chatKeyCache = {};
+      return;
+    }
+    chatKeyCache = JSON.parse(raw);
+  } catch {
+    chatKeyCache = {};
+  }
+}
+
+function saveChatKeyCache() {
+  localStorage.setItem("talky_chat_keys", JSON.stringify(chatKeyCache));
+}
+
+// Generate a human-ish code: groups of letters + emojis
+function generateChatKeyCode() {
+  const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const emojis = ["😀", "😎", "✨", "🔥", "🌙", "⭐", "🎧", "📞", "💬", "🔒"];
+  function randChars(len) {
+    let out = "";
+    for (let i = 0; i < len; i++) {
+      const idx = Math.floor(Math.random() * letters.length);
+      out += letters[idx];
+    }
+    return out;
+  }
+  let code = `${randChars(4)}-${randChars(4)}-${randChars(4)}-${randChars(4)}`;
+  const e1 = emojis[Math.floor(Math.random() * emojis.length)];
+  const e2 = emojis[Math.floor(Math.random() * emojis.length)];
+  code += ` ${e1}${e2}`;
+  return code;
+}
+
+async function deriveKeyBytesFromCode(code) {
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(code));
+  return new Uint8Array(digest);
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function bufToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToBuf(b64) {
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function getAesKeyFromCode(code) {
+  const keyBytes = await deriveKeyBytesFromCode(code);
+  return crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, [
+    "encrypt",
+    "decrypt"
+  ]);
+}
+
+async function encryptMessageForChat(chatId, plaintext) {
+  const entry = chatKeyCache[chatId];
+  if (!entry || !entry.code) {
+    throw new Error("Missing chat key code for this chat.");
+  }
+  const key = await getAesKeyFromCode(entry.code);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertextBuf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    enc.encode(plaintext)
+  );
+  return {
+    ciphertext: bufToBase64(ciphertextBuf),
+    iv: bufToBase64(iv.buffer)
+  };
+}
+
+async function decryptMessageForChat(chat, message) {
+  const entry = chatKeyCache[chat.id];
+  if (!entry || !entry.code) {
+    throw new Error("Missing chat key code");
+  }
+  const key = await getAesKeyFromCode(entry.code);
+  try {
+    const ivBuf = base64ToBuf(message.iv);
+    const cipherBuf = base64ToBuf(message.ciphertext);
+    const plainBuf = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: new Uint8Array(ivBuf) },
+      key,
+      cipherBuf
+    );
+    return dec.decode(plainBuf);
+  } catch (e) {
+    throw new Error("Decryption failed");
+  }
+}
+
+// ---------- Auth flow ----------
 async function refreshMe() {
   try {
     const res = await jsonFetch("/api/me");
@@ -105,15 +230,19 @@ async function refreshMe() {
       headerUserId.textContent = `ID: ${currentUser.id}`;
       hide(authScreen);
       show(mainScreen);
+      loadChatKeyCache();
+      startPendingCallPolling();
       await loadChats();
     } else {
       show(authScreen);
       hide(mainScreen);
+      stopPendingCallPolling();
     }
   } catch (err) {
     console.error("Failed to refresh /api/me:", err);
     show(authScreen);
     hide(mainScreen);
+    stopPendingCallPolling();
   }
 }
 
@@ -137,6 +266,8 @@ btnSignup.addEventListener("click", async () => {
     headerUserId.textContent = `ID: ${currentUser.id}`;
     signupUsernameInput.value = "";
     signupPasswordInput.value = "";
+    loadChatKeyCache();
+    startPendingCallPolling();
     await loadChats();
     hide(authScreen);
     show(mainScreen);
@@ -165,6 +296,8 @@ btnLogin.addEventListener("click", async () => {
     headerUsername.textContent = currentUser.username;
     headerUserId.textContent = `ID: ${currentUser.id}`;
     loginPasswordInput.value = "";
+    loadChatKeyCache();
+    startPendingCallPolling();
     await loadChats();
     hide(authScreen);
     show(mainScreen);
@@ -184,10 +317,12 @@ btnLogout.addEventListener("click", async () => {
   activeChatId = null;
   chatItemsEl.innerHTML = "";
   chatMessages.innerHTML = "";
+  stopPendingCallPolling();
   show(authScreen);
   hide(mainScreen);
 });
 
+// ---------- Chats + messages ----------
 async function loadChats() {
   if (!currentUser) return;
   try {
@@ -195,6 +330,13 @@ async function loadChats() {
     chats = res.chats || [];
     messagesByChat = res.messagesByChat || {};
     renderChatList();
+    if (activeChatId) {
+      const chat = chats.find((c) => c.id === activeChatId);
+      if (chat) {
+        renderChatDetail(chat);
+        return;
+      }
+    }
     renderChatDetail(null);
   } catch (err) {
     console.error("Failed to load chats:", err);
@@ -209,12 +351,7 @@ function renderChatList() {
 
   const visible = chats.filter((c) => {
     if (!q) return true;
-    const msgs = messagesByChat[c.id] || [];
-    const lastText = msgs.length ? msgs[msgs.length - 1].text : "";
-    return (
-      c.name.toLowerCase().includes(q) ||
-      lastText.toLowerCase().includes(q)
-    );
+    return c.name.toLowerCase().includes(q);
   });
 
   if (!visible.length) {
@@ -253,21 +390,24 @@ function renderChatList() {
     const rightCol = document.createElement("div");
     rightCol.style.textAlign = "right";
 
-    const msgs = messagesByChat[chat.id] || [];
-    const lastMessage = msgs.length ? msgs[msgs.length - 1].text : "";
-
     const msgEl = document.createElement("div");
     msgEl.className = "chat-last-message";
-    msgEl.textContent = lastMessage;
 
     const metaEl = document.createElement("div");
     metaEl.className = "chat-meta";
-    metaEl.textContent = msgs.length
-      ? new Date(msgs[msgs.length - 1].ts).toLocaleTimeString([], {
-          hour: "numeric",
-          minute: "2-digit"
-        })
-      : "";
+
+    const msgs = messagesByChat[chat.id] || [];
+    if (msgs.length) {
+      const last = msgs[msgs.length - 1];
+      msgEl.textContent = "[Encrypted message]";
+      metaEl.textContent = new Date(last.ts).toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit"
+      });
+    } else {
+      msgEl.textContent = "No messages yet";
+      metaEl.textContent = "";
+    }
 
     rightCol.appendChild(msgEl);
     rightCol.appendChild(metaEl);
@@ -288,29 +428,43 @@ function renderChatList() {
   });
 }
 
-function renderMessages(messages) {
+async function renderMessages(chat) {
   chatMessages.innerHTML = "";
-  if (!messages || !messages.length) {
+  const messages = messagesByChat[chat.id] || [];
+
+  if (!messages.length) {
     const info = document.createElement("div");
     info.style.fontSize = "12px";
     info.style.color = "#777";
-    info.textContent = "Pick a chat on the left to see the conversation here.";
+    info.textContent = "No messages yet. Say hi!";
     chatMessages.appendChild(info);
     return;
   }
 
-  messages.forEach((m) => {
+  let hasKey = !!(chatKeyCache[chat.id] && chatKeyCache[chat.id].code);
+
+  for (const m of messages) {
     const row = document.createElement("div");
     const isMe = currentUser && m.fromUserId === currentUser.id;
     row.className = "msg-row " + (isMe ? "me" : "them");
 
     const bubble = document.createElement("div");
     bubble.className = "msg-bubble " + (isMe ? "me" : "them");
-    bubble.textContent = m.text;
+
+    if (!hasKey) {
+      bubble.textContent = "🔒 Encrypted message (no chat key)";
+    } else {
+      try {
+        const text = await decryptMessageForChat(chat, m);
+        bubble.textContent = text;
+      } catch (e) {
+        bubble.textContent = "🔒 Unable to decrypt (key mismatch)";
+      }
+    }
 
     row.appendChild(bubble);
     chatMessages.appendChild(row);
-  });
+  }
 
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
@@ -320,14 +474,74 @@ function renderChatDetail(chat) {
     chatDetailName.textContent = "Select a chat";
     chatDetailPresence.textContent = "No conversation selected.";
     chatCallTarget.textContent = "Talky ID will show here";
-    renderMessages([]);
+    chatMessages.innerHTML = "";
+    const info = document.createElement("div");
+    info.style.fontSize = "12px";
+    info.style.color = "#777";
+    info.textContent = "Pick a chat on the left to see the conversation here.";
+    chatMessages.appendChild(info);
     return;
   }
+
   chatDetailName.textContent = chat.name;
-  chatDetailPresence.textContent = "Talky chat owned by your ID.";
+
+  const others = (chat.participantIds || []).filter(
+    (id) => currentUser && id !== currentUser.id
+  );
+  if (!others.length) {
+    chatDetailPresence.textContent = "Just you in this chat.";
+  } else {
+    chatDetailPresence.textContent =
+      chat.type === "group"
+        ? `Group chat with ${others.length} others.`
+        : "Direct chat.";
+  }
+
   chatCallTarget.textContent = `Your Talky ID: ${currentUser ? currentUser.id : "?"}`;
-  const messages = messagesByChat[chat.id] || [];
-  renderMessages(messages);
+
+  // Show key status
+  const hasKey = !!(chatKeyCache[chat.id] && chatKeyCache[chat.id].code);
+  if (!hasKey) {
+    chatDetailPresence.textContent += " • 🔒 Locked (no chat key)";
+    const btn = document.createElement("button");
+    btn.className = "btn-pill";
+    btn.textContent = "Import chat key";
+    btn.style.marginLeft = "8px";
+    btn.addEventListener("click", () => importKeyForChat(chat));
+    chatDetailPresence.appendChild(document.createTextNode(" "));
+    chatDetailPresence.appendChild(btn);
+  }
+
+  renderMessages(chat);
+}
+
+async function importKeyForChat(chat) {
+  const code = prompt(
+    "Paste the chat key code for this conversation (the letters + emojis)."
+  );
+  if (!code) return;
+  try {
+    const keyBytes = await deriveKeyBytesFromCode(code);
+    const hashHex = bytesToHex(keyBytes);
+    const expected = chat.encryption && chat.encryption.keyHash;
+    if (!expected) {
+      alert("This chat does not have encryption metadata.");
+      return;
+    }
+    if (hashHex !== expected) {
+      alert("That key does not match this chat.");
+      return;
+    }
+    if (!chatKeyCache[chat.id]) chatKeyCache[chat.id] = {};
+    chatKeyCache[chat.id].code = code;
+    saveChatKeyCache();
+    alert("Chat key saved. Reloading messages...");
+    await loadChats();
+    const c = chats.find((x) => x.id === chat.id);
+    if (c) renderChatDetail(c);
+  } catch (e) {
+    alert("Failed to import key: " + e.message);
+  }
 }
 
 chatSearchInput.addEventListener("input", () => {
@@ -353,18 +567,30 @@ async function sendMessage() {
   const text = chatInput.value.trim();
   if (!text) return;
 
+  const chat = chats.find((c) => c.id === activeChatId);
+  if (!chat) {
+    alert("Chat not found.");
+    return;
+  }
+
+  if (!chatKeyCache[chat.id] || !chatKeyCache[chat.id].code) {
+    alert("This chat is locked. Import the chat key first.");
+    return;
+  }
+
   try {
+    const { ciphertext, iv } = await encryptMessageForChat(chat.id, text);
     const res = await jsonFetch("/api/messages", {
       method: "POST",
-      body: JSON.stringify({ chatId: activeChatId, text })
+      body: JSON.stringify({ chatId: chat.id, ciphertext, iv })
     });
     const msg = res.message;
-    if (!messagesByChat[activeChatId]) messagesByChat[activeChatId] = [];
-    messagesByChat[activeChatId].push(msg);
+    if (!messagesByChat[chat.id]) messagesByChat[chat.id] = [];
+    messagesByChat[chat.id].push(msg);
     chatInput.value = "";
     renderChatList();
-    const chat = chats.find((c) => c.id === activeChatId);
-    if (chat) renderChatDetail(chat);
+    const updatedChat = chats.find((c) => c.id === chat.id);
+    if (updatedChat) renderChatDetail(updatedChat);
   } catch (err) {
     console.error("Failed to send message:", err);
     alert(err.message || "Failed to send message.");
@@ -372,34 +598,60 @@ async function sendMessage() {
 }
 
 btnNewChat.addEventListener("click", async () => {
+  if (!currentUser) return;
   const name = prompt("Chat name:");
   if (!name) return;
+  const rawParticipants = prompt(
+    "Enter usernames to add (comma-separated, at least one)."
+  );
+  if (!rawParticipants) return;
+  const participants = rawParticipants
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!participants.length) {
+    alert("You must add at least one other user.");
+    return;
+  }
+
+  const code = generateChatKeyCode();
+  const keyBytes = await deriveKeyBytesFromCode(code);
+  const encryptionKeyHash = bytesToHex(keyBytes);
+
   try {
     const res = await jsonFetch("/api/chats", {
       method: "POST",
-      body: JSON.stringify({ name })
+      body: JSON.stringify({ name, participants, encryptionKeyHash })
     });
-    chats.push(res.chat);
-    messagesByChat[res.chat.id] = [];
-    activeChatId = res.chat.id;
+    const chat = res.chat;
+
+    if (!chatKeyCache[chat.id]) chatKeyCache[chat.id] = {};
+    chatKeyCache[chat.id].code = code;
+    saveChatKeyCache();
+
+    chats.push(chat);
+    messagesByChat[chat.id] = [];
+    activeChatId = chat.id;
     renderChatList();
-    renderChatDetail(res.chat);
+    renderChatDetail(chat);
+
+    alert(
+      "Chat created.\n\nShare this chat key code with the other people so they can decrypt messages:\n\n" +
+        code
+    );
   } catch (err) {
     console.error("Failed to create chat:", err);
     alert(err.message || "Failed to create chat.");
   }
 });
 
-function openCallOverlay(type) {
-  if (!currentUser) {
-    alert("Log in first.");
-    return;
-  }
-  const chat = chats.find((c) => c.id === activeChatId);
-  let targetName = chat ? chat.name : "Talky contact";
+// ---------- Calls (signaling only) ----------
+function openCallOverlayLayout(callType, title, bodyContent) {
   callDialogTitle.textContent =
-    type === "video" ? "Video Call" : "Audio Call";
-  renderCallScreen(type, targetName);
+    callType === "video" ? "Video Call" : "Audio Call";
+  callDialogBody.innerHTML = "";
+  callDialogBody.appendChild(bodyContent);
   callOverlay.classList.remove("hidden");
 }
 
@@ -414,12 +666,7 @@ callOverlay.addEventListener("click", (e) => {
   }
 });
 
-videoCallBtn.addEventListener("click", () => openCallOverlay("video"));
-audioCallBtn.addEventListener("click", () => openCallOverlay("audio"));
-
-function renderCallScreen(type, name) {
-  callDialogBody.innerHTML = "";
-
+function buildCallScreen(name, type, statusText, extraButtons = []) {
   const screen = document.createElement("div");
   screen.className = "call-screen";
 
@@ -438,13 +685,12 @@ function renderCallScreen(type, name) {
 
   const statusEl = document.createElement("div");
   statusEl.className = "call-status";
-  statusEl.textContent =
-    type === "video" ? "Video calling using Talky IDs…" : "Audio calling using Talky IDs…";
+  statusEl.textContent = statusText;
 
   const typePill = document.createElement("div");
   typePill.className = "call-type-pill";
   typePill.textContent =
-    type === "video" ? "Video call (layout demo)" : "Audio call (layout demo)";
+    type === "video" ? "Video call" : "Audio call";
 
   const buttonsRow = document.createElement("div");
   buttonsRow.className = "call-buttons";
@@ -455,6 +701,7 @@ function renderCallScreen(type, name) {
   endBtn.addEventListener("click", closeCallOverlay);
 
   buttonsRow.appendChild(endBtn);
+  extraButtons.forEach((b) => buttonsRow.appendChild(b));
 
   screen.appendChild(avatar);
   screen.appendChild(nameEl);
@@ -462,13 +709,236 @@ function renderCallScreen(type, name) {
   screen.appendChild(typePill);
   screen.appendChild(buttonsRow);
 
-  callDialogBody.appendChild(screen);
+  return screen;
 }
 
-let isAdminOpen = false;
+function openCallStartDialog(type) {
+  if (!currentUser) {
+    alert("Log in first.");
+    return;
+  }
 
+  const container = document.createElement("div");
+  container.style.display = "flex";
+  container.style.flexDirection = "column";
+  container.style.gap = "10px";
+
+  const label1 = document.createElement("div");
+  label1.textContent = "Start a call with:";
+  label1.style.fontSize = "13px";
+
+  const select = document.createElement("select");
+  select.style.width = "100%";
+  select.style.padding = "6px";
+  select.style.borderRadius = "10px";
+  select.style.border = "1px solid #e5e5ea";
+  const optionNone = document.createElement("option");
+  optionNone.value = "";
+  optionNone.textContent = "— Pick from your chats —";
+  select.appendChild(optionNone);
+
+  chats.forEach((chat) => {
+    const others = (chat.participantIds || []).filter(
+      (id) => currentUser && id !== currentUser.id
+    );
+    if (!others.length) return;
+    const opt = document.createElement("option");
+    opt.value = chat.id;
+    opt.textContent = `${chat.name} (${chat.type === "group" ? "group" : "dm"})`;
+    select.appendChild(opt);
+  });
+
+  const orDiv = document.createElement("div");
+  orDiv.style.fontSize = "11px";
+  orDiv.style.color = "#999";
+  orDiv.textContent = "or call by username:";
+
+  const usernameInput = document.createElement("input");
+  usernameInput.type = "text";
+  usernameInput.placeholder = "Username (exact)";
+  usernameInput.style.width = "100%";
+  usernameInput.style.padding = "8px";
+  usernameInput.style.borderRadius = "10px";
+  usernameInput.style.border = "1px solid #e5e5ea";
+
+  const startBtn = document.createElement("button");
+  startBtn.className = "btn btn-primary";
+  startBtn.textContent = type === "video" ? "Start video call" : "Start audio call";
+  startBtn.style.marginTop = "4px";
+
+  startBtn.addEventListener("click", async () => {
+    let toUsername = usernameInput.value.trim();
+    let chatId = null;
+
+    if (!toUsername && select.value) {
+      const chat = chats.find((c) => c.id === select.value);
+      if (!chat) {
+        alert("Chat not found.");
+        return;
+      }
+      const others = (chat.participantIds || []).filter(
+        (id) => currentUser && id !== currentUser.id
+      );
+      if (!others.length) {
+        alert("This chat has no other users.");
+        return;
+      }
+      toUsername = prompt(
+        "This chat may include multiple users.\n\nEnter the username you want to call from this chat:"
+      );
+      if (!toUsername) return;
+      chatId = chat.id;
+    } else if (!toUsername && !select.value) {
+      alert("Select a chat or type a username.");
+      return;
+    }
+
+    try {
+      const res = await jsonFetch("/api/calls", {
+        method: "POST",
+        body: JSON.stringify({ toUsername, type, chatId })
+      });
+      const call = res.call;
+      const name = toUsername;
+      const screen = buildCallScreen(
+        name,
+        type,
+        "Calling using Talky IDs…"
+      );
+      openCallOverlayLayout(type, type === "video" ? "Video Call" : "Audio Call", screen);
+    } catch (err) {
+      alert(err.message || "Failed to start call.");
+    }
+  });
+
+  container.appendChild(label1);
+  container.appendChild(select);
+  container.appendChild(orDiv);
+  container.appendChild(usernameInput);
+  container.appendChild(startBtn);
+
+  openCallOverlayLayout(type, type === "video" ? "Video Call" : "Audio Call", container);
+}
+
+videoCallBtn.addEventListener("click", () => openCallStartDialog("video"));
+audioCallBtn.addEventListener("click", () => openCallStartDialog("audio"));
+
+// Poll for incoming calls
+async function pollPendingCalls() {
+  if (!currentUser) return;
+  try {
+    const res = await jsonFetch("/api/calls/pending");
+    const calls = res.calls || [];
+    if (!calls.length) return;
+    const call = calls[0];
+
+    const fromUserLabel = `User ${call.fromUserId}`;
+    const screen = document.createElement("div");
+    screen.className = "call-screen";
+
+    const avatar = document.createElement("div");
+    avatar.className = "call-avatar";
+    avatar.textContent = "IN";
+
+    const nameEl = document.createElement("div");
+    nameEl.className = "call-name";
+    nameEl.textContent = fromUserLabel;
+
+    const statusEl = document.createElement("div");
+    statusEl.className = "call-status";
+    statusEl.textContent =
+      call.type === "video"
+        ? "Incoming video call…"
+        : "Incoming audio call…";
+
+    const typePill = document.createElement("div");
+    typePill.className = "call-type-pill";
+    typePill.textContent =
+      call.type === "video" ? "Video call" : "Audio call";
+
+    const buttonsRow = document.createElement("div");
+    buttonsRow.className = "call-buttons";
+
+    const acceptBtn = document.createElement("button");
+    acceptBtn.className = "btn btn-primary";
+    acceptBtn.textContent = "Accept";
+    acceptBtn.style.borderRadius = "999px";
+    acceptBtn.addEventListener("click", async () => {
+      try {
+        await jsonFetch(`/api/calls/${encodeURIComponent(call.id)}/accept`, {
+          method: "POST"
+        });
+        const inCallScreen = buildCallScreen(
+          fromUserLabel,
+          call.type,
+          "Call connected (demo)."
+        );
+        openCallOverlayLayout(call.type, "In Call", inCallScreen);
+      } catch (err) {
+        alert(err.message || "Failed to accept call.");
+      }
+    });
+
+    const declineBtn = document.createElement("button");
+    declineBtn.className = "btn-pill";
+    declineBtn.textContent = "Decline";
+    declineBtn.addEventListener("click", async () => {
+      try {
+        await jsonFetch(`/api/calls/${encodeURIComponent(call.id)}/decline`, {
+          method: "POST"
+        });
+        closeCallOverlay();
+      } catch (err) {
+        alert(err.message || "Failed to decline.");
+      }
+    });
+
+    const endBtn = document.createElement("button");
+    endBtn.className = "call-end-btn";
+    endBtn.textContent = "✕";
+    endBtn.addEventListener("click", async () => {
+      try {
+        await jsonFetch(`/api/calls/${encodeURIComponent(call.id)}/decline`, {
+          method: "POST"
+        });
+        closeCallOverlay();
+      } catch (err) {
+        closeCallOverlay();
+      }
+    });
+
+    buttonsRow.appendChild(acceptBtn);
+    buttonsRow.appendChild(declineBtn);
+    buttonsRow.appendChild(endBtn);
+
+    screen.appendChild(avatar);
+    screen.appendChild(nameEl);
+    screen.appendChild(statusEl);
+    screen.appendChild(typePill);
+    screen.appendChild(buttonsRow);
+
+    openCallOverlayLayout(call.type, "Incoming Call", screen);
+  } catch (err) {
+    console.error("Failed to poll calls:", err);
+  }
+}
+
+function startPendingCallPolling() {
+  if (pendingCallPollTimer) return;
+  pendingCallPollTimer = setInterval(pollPendingCalls, 5000);
+}
+
+function stopPendingCallPolling() {
+  if (pendingCallPollTimer) {
+    clearInterval(pendingCallPollTimer);
+    pendingCallPollTimer = null;
+  }
+}
+
+// ---------- Admin secret menu ----------
 document.addEventListener("keydown", async (e) => {
-  const onLoginScreen = !authScreen.classList.contains("hidden") &&
+  const onLoginScreen =
+    !authScreen.classList.contains("hidden") &&
     mainScreen.classList.contains("hidden");
 
   if (
@@ -561,7 +1031,11 @@ async function loadAdminUsers() {
       delBtn.className = "admin-delete-btn";
       delBtn.textContent = "Delete";
       delBtn.addEventListener("click", async () => {
-        if (!confirm(`Delete user ${u.username}? This removes their chats/messages.`)) {
+        if (
+          !confirm(
+            `Delete user ${u.username}? This removes their chats, messages, and calls.`
+          )
+        ) {
           return;
         }
         try {
@@ -589,5 +1063,6 @@ async function loadAdminUsers() {
   }
 }
 
+// ---------- Init ----------
 switchAuthTab("login");
 refreshMe();

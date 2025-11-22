@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Talky – Calling & Messaging Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="main-screen" class="main-shell fade-in">
+      <div class="main-inner">
+        <!-- Header -->
+        <header class="main-header">
+          <div class="header-left">
+            <div class="dot"></div>
+            <div>
+              <div class="header-title">Talky</div>
+              <div class="header-sub">Calls, video, and messages in one place.</div>
+            </div>
+          </div>
+          <div class="header-right">
+            <div class="user-pill">
+              Demo user: <span id="header-username">guest</span>
+            </div>
+          </div>
+        </header>
+
+        <!-- Call section -->
+        <section class="call-section">
+          <div class="call-panel">
+            <div class="call-buttons-row">
+              <button class="call-btn video" id="btn-video-call">
+                <span>📹</span>
+                <span>Video Call</span>
+              </button>
+              <button class="call-btn audio" id="btn-audio-call">
+                <span>📞</span>
+                <span>Audio Call</span>
+              </button>
+            </div>
+            <div class="call-caption">
+              <strong>Click a call button</strong> to preview how a call layout would look.
+              (This demo doesn’t actually connect calls or use WebRTC yet.)
+            </div>
+          </div>
+        </section>
+
+        <!-- Messages section -->
+        <section class="messages-section">
+          <div class="chat-header">
+            <div class="chat-header-left">
+              <div class="chat-header-title">Messages</div>
+              <div class="chat-header-sub">
+                Talks are stored in a JSON file in your GitHub repo.
+              </div>
+            </div>
+            <div class="chat-actions">
+              <button class="btn-pill" id="btn-new-chat">
+                <span class="dot-small"></span>
+                <span>New chat (demo)</span>
+              </button>
+              <span class="badge-demo">GitHub-backed</span>
+            </div>
+          </div>
+
+          <div class="messages-body">
+            <!-- chat list -->
+            <div class="chat-list">
+              <div class="chat-search">
+                <input type="search" id="chat-search-input" placeholder="Search people & messages" />
+              </div>
+              <div class="chat-items" id="chat-items"></div>
+            </div>
+
+            <!-- chat detail -->
+            <div class="chat-detail">
+              <div class="chat-detail-header">
+                <div>
+                  <div class="chat-detail-name" id="chat-detail-name">Select a chat</div>
+                  <div class="chat-detail-presence" id="chat-detail-presence">
+                    No conversation selected.
+                  </div>
+                </div>
+                <span class="badge-demo">Stored in GitHub</span>
+              </div>
+              <div class="chat-messages" id="chat-messages"></div>
+              <div class="chat-input-row">
+                <input type="text" id="chat-input" placeholder="Message (saved to GitHub JSON)..." />
+                <button class="btn btn-primary" id="btn-chat-send">Send</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Call overlay -->
+      <div id="call-overlay" class="call-overlay hidden">
+        <div class="call-dialog">
+          <div class="call-dialog-header">
+            <span id="call-dialog-title">New Call</span>
+            <button class="call-dialog-close" id="call-dialog-close">✕</button>
+          </div>
+          <div class="call-dialog-body" id="call-dialog-body"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

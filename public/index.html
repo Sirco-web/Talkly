@@ -5,6 +5,86 @@
   <title>Talky</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="/styles.css" />
+  <style>
+    /* filepath: /workspaces/Talkly/public/index.html (additional mobile + modal css) */
+    /* Basic responsive layout */
+    @media (max-width: 800px) {
+      .app-shell {
+        flex-direction: column;
+        gap: 12px;
+        padding: 12px;
+      }
+      .panel {
+        width: 100% !important;
+        min-height: 200px;
+      }
+      .panel-left, .panel-right {
+        box-shadow: none;
+      }
+      .chat-input-row {
+        flex-direction: column;
+        gap: 8px;
+      }
+      .chat-input-row input,
+      .chat-input-row button {
+        width: 100%;
+      }
+      .call-strip {
+        display: flex;
+        flex-direction: row;
+        gap: 8px;
+        padding: 8px;
+      }
+      .call-button {
+        flex: 1;
+      }
+    }
+
+    /* Modal overlay + dialog (used by new chat) */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1200;
+      padding: 16px;
+    }
+    .modal-dialog {
+      width: 100%;
+      max-width: 560px;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+      padding: 16px;
+      box-sizing: border-box;
+      max-height: 90vh;
+      overflow: auto;
+    }
+    .modal-header {
+      display:flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .modal-title {
+      font-weight: 600;
+      font-size: 16px;
+    }
+    .modal-row { margin: 8px 0; display:flex; flex-direction: column; gap:6px; }
+    .modal-row input, .modal-row textarea {
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid #e5e5ea;
+      font-size: 14px;
+    }
+    .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+    .copy-code-row { display:flex; gap:8px; align-items:center; margin-top:8px; }
+    .btn-copy { padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#f5f5f7; cursor:pointer; }
+    .modal-note { font-size:12px; color:#666; margin-top:6px; }
+  </style>
 </head>
 <body>
   <!-- AUTH SCREEN -->
@@ -45,10 +125,6 @@
         </div>
         <button id="btn-signup" class="btn-primary">Create Account</button>
         <div id="auth-signup-error" class="auth-error"></div>
-      </div>
-
-      <div class="auth-footer-note">
-        On the login screen, press <b>Ctrl + Alt + Shift + Z</b> to open the admin panel.
       </div>
     </div>
   </div>

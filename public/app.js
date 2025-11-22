@@ -597,54 +597,196 @@ async function sendMessage() {
   }
 }
 
-btnNewChat.addEventListener("click", async () => {
-  if (!currentUser) return;
-  const name = prompt("Chat name:");
-  if (!name) return;
-  const rawParticipants = prompt(
-    "Enter usernames to add (comma-separated, at least one)."
-  );
-  if (!rawParticipants) return;
-  const participants = rawParticipants
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  if (!participants.length) {
-    alert("You must add at least one other user.");
-    return;
-  }
-
-  const code = generateChatKeyCode();
-  const keyBytes = await deriveKeyBytesFromCode(code);
-  const encryptionKeyHash = bytesToHex(keyBytes);
-
-  try {
-    const res = await jsonFetch("/api/chats", {
-      method: "POST",
-      body: JSON.stringify({ name, participants, encryptionKeyHash })
-    });
-    const chat = res.chat;
-
-    if (!chatKeyCache[chat.id]) chatKeyCache[chat.id] = {};
-    chatKeyCache[chat.id].code = code;
-    saveChatKeyCache();
-
-    chats.push(chat);
-    messagesByChat[chat.id] = [];
-    activeChatId = chat.id;
-    renderChatList();
-    renderChatDetail(chat);
-
-    alert(
-      "Chat created.\n\nShare this chat key code with the other people so they can decrypt messages:\n\n" +
-        code
-    );
-  } catch (err) {
-    console.error("Failed to create chat:", err);
-    alert(err.message || "Failed to create chat.");
-  }
+btnNewChat.addEventListener("click", () => {
+  openNewChatModal();
 });
+
+function openNewChatModal() {
+  // Build modal elements
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+
+  const dialog = document.createElement("div");
+  dialog.className = "modal-dialog";
+
+  const header = document.createElement("div");
+  header.className = "modal-header";
+  const title = document.createElement("div");
+  title.className = "modal-title";
+  title.textContent = "Create new chat";
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "✕";
+  closeBtn.className = "call-end-btn";
+  closeBtn.addEventListener("click", () => document.body.removeChild(overlay));
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const rowName = document.createElement("div");
+  rowName.className = "modal-row";
+  const lblName = document.createElement("div");
+  lblName.textContent = "Chat name";
+  const inputName = document.createElement("input");
+  inputName.type = "text";
+  inputName.placeholder = "e.g. Friends";
+  rowName.appendChild(lblName);
+  rowName.appendChild(inputName);
+
+  const rowParticipants = document.createElement("div");
+  rowParticipants.className = "modal-row";
+  const lblPart = document.createElement("div");
+  lblPart.textContent = "Participants (comma-separated). Accepts usernames or Talky IDs like u_xxx";
+  const inputPart = document.createElement("input");
+  inputPart.type = "text";
+  inputPart.placeholder = "alice, bob, u_12ab34cd";
+  rowParticipants.appendChild(lblPart);
+  rowParticipants.appendChild(inputPart);
+
+  const note = document.createElement("div");
+  note.className = "modal-note";
+  note.textContent =
+    "Tip: other users must have existing accounts. You can provide usernames or their Talky ID.";
+
+  const actions = document.createElement("div");
+  actions.className = "modal-actions";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "btn-pill";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", () => document.body.removeChild(overlay));
+
+  const createBtn = document.createElement("button");
+  createBtn.className = "btn btn-primary";
+  createBtn.textContent = "Create chat";
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(createBtn);
+
+  // Area to show generated chat key for sharing
+  const keyArea = document.createElement("div");
+  keyArea.style.display = "none";
+  keyArea.className = "modal-row";
+
+  const keyLabel = document.createElement("div");
+  keyLabel.textContent = "Chat key (share with participants to decrypt messages):";
+
+  const keyInputRow = document.createElement("div");
+  keyInputRow.className = "copy-code-row";
+
+  const keyInput = document.createElement("textarea");
+  keyInput.readOnly = true;
+  keyInput.rows = 2;
+  keyInput.style.flex = "1";
+  keyInput.style.resize = "none";
+
+  const copyBtn = document.createElement("button");
+  copyBtn.className = "btn-copy";
+  copyBtn.textContent = "Copy";
+  copyBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(keyInput.value);
+      copyBtn.textContent = "Copied";
+      setTimeout(() => (copyBtn.textContent = "Copy"), 1500);
+    } catch {
+      // fallback
+      keyInput.select();
+      document.execCommand("copy");
+      copyBtn.textContent = "Copied";
+      setTimeout(() => (copyBtn.textContent = "Copy"), 1500);
+    }
+  });
+
+  keyInputRow.appendChild(keyInput);
+  keyInputRow.appendChild(copyBtn);
+  keyArea.appendChild(keyLabel);
+  keyArea.appendChild(keyInputRow);
+
+  dialog.appendChild(header);
+  dialog.appendChild(rowName);
+  dialog.appendChild(rowParticipants);
+  dialog.appendChild(note);
+  dialog.appendChild(actions);
+  dialog.appendChild(keyArea);
+
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  createBtn.addEventListener("click", async () => {
+    const name = inputName.value.trim();
+    const rawParticipants = inputPart.value.trim();
+    if (!name) {
+      alert("Please enter a chat name.");
+      return;
+    }
+    if (!rawParticipants) {
+      alert("Enter at least one participant (username or Talky ID).");
+      return;
+    }
+    const participants = rawParticipants
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (!participants.length) {
+      alert("You must add at least one other user.");
+      return;
+    }
+
+    // Resolve identifiers -> user ids on the server
+    let resolved;
+    try {
+      const res = await jsonFetch("/api/users/lookup", {
+        method: "POST",
+        body: JSON.stringify({ identifiers: participants })
+      });
+      resolved = res.users || [];
+    } catch (err) {
+      alert(err.message || "Failed to resolve participants. Make sure usernames or IDs are correct.");
+      return;
+    }
+
+    const participantIds = resolved.map((u) => u.id);
+
+    // Generate chat key and hash
+    const code = generateChatKeyCode();
+    let keyBytes;
+    try {
+      keyBytes = await deriveKeyBytesFromCode(code);
+    } catch (e) {
+      alert("Failed to derive chat key.");
+      return;
+    }
+    const encryptionKeyHash = bytesToHex(keyBytes);
+
+    try {
+      const res = await jsonFetch("/api/chats", {
+        method: "POST",
+        body: JSON.stringify({ name, participants: participantIds, encryptionKeyHash })
+      });
+      const chat = res.chat;
+
+      if (!chatKeyCache[chat.id]) chatKeyCache[chat.id] = {};
+      chatKeyCache[chat.id].code = code;
+      saveChatKeyCache();
+
+      // Update local state/UI
+      chats.push(chat);
+      messagesByChat[chat.id] = [];
+      activeChatId = chat.id;
+      renderChatList();
+      renderChatDetail(chat);
+
+      // Show the generated code in the modal for easy copy
+      keyInput.value = code;
+      keyArea.style.display = "block";
+
+      // disable create button and change label
+      createBtn.disabled = true;
+      createBtn.textContent = "Created";
+    } catch (err) {
+      console.error("Failed to create chat:", err);
+      alert(err.message || "Failed to create chat.");
+    }
+  });
+}
 
 // ---------- Calls (signaling only) ----------
 function openCallOverlayLayout(callType, title, bodyContent) {

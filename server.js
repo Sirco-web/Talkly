@@ -4,6 +4,19 @@ const path = require("path");
 const crypto = require("crypto");
 const session = require("express-session");
 
+// Add a portable fetch reference (Node >=18 has global fetch; fallback to undici)
+let fetch = globalThis.fetch;
+if (!fetch) {
+  try {
+    fetch = require("undici").fetch;
+  } catch (e) {
+    console.error(
+      "Fetch API not available. Install 'undici' (npm install undici) or run Node >=18."
+    );
+    throw e;
+  }
+}
+
 const app = express();
 
 const PORT = process.env.PORT || 3000;
@@ -57,14 +70,26 @@ function verifyPassword(password, stored) {
 
 async function githubRequest(path, options = {}) {
   const url = `https://api.github.com${path}`;
+
+  // Merge default headers with any provided in options
+  const defaultHeaders = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${GITHUB_TOKEN}`,
+    "X-GitHub-Api-Version": "2022-11-28"
+  };
+  const providedHeaders = options.headers || {};
+  const headers = { ...defaultHeaders, ...providedHeaders };
+
+  // If a body is present and Content-Type wasn't explicitly provided, assume JSON
+  if (options.body && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const res = await fetch(url, {
-    headers: {
-      "Accept": "application/vnd.github+json",
-      "Authorization": `Bearer ${GITHUB_TOKEN}`,
-      "X-GitHub-Api-Version": "2022-11-28"
-    },
-    ...options
+    ...options,
+    headers
   });
+
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`GitHub ${res.status} ${res.statusText}: ${text}`);
@@ -273,14 +298,24 @@ app.post("/api/chats", requireAuth, async (req, res) => {
   const currentUserId = req.session.userId;
   participantIds.push(currentUserId);
 
-  for (const uname of participants) {
-    const u = allUsers.find(
-      (user) => user.username.toLowerCase() === String(uname).toLowerCase()
-    );
-    if (!u) {
-      return res
-        .status(400)
-        .json({ error: `User not found: ${uname}` });
+  for (const pid of participants) {
+    // accept either a username (string) or a Talky user id like "u_abc123"
+    if (typeof pid !== "string") {
+      return res.status(400).json({ error: `Invalid participant value: ${String(pid)}` });
+    }
+    let u = null;
+    if (pid.startsWith("u_")) {
+      u = allUsers.find((user) => user.id === pid);
+      if (!u) {
+        return res.status(400).json({ error: `User ID not found: ${pid}` });
+      }
+    } else {
+      u = allUsers.find(
+        (user) => user.username.toLowerCase() === String(pid).toLowerCase()
+      );
+      if (!u) {
+        return res.status(400).json({ error: `User not found: ${pid}` });
+      }
     }
     if (!participantIds.includes(u.id)) {
       participantIds.push(u.id);
@@ -466,6 +501,48 @@ app.delete("/api/admin/users/:id", requireAdmin, async (req, res) => {
 
   await saveDB(db);
   res.json({ ok: true });
+});
+
+// Resolve a list of usernames or user IDs to user objects (id + username)
+app.post("/api/users/lookup", requireAuth, async (req, res) => {
+  const { identifiers } = req.body || {};
+  if (!Array.isArray(identifiers) || !identifiers.length) {
+    return res.status(400).json({ error: "identifiers array required." });
+  }
+
+  const db = await loadDB();
+  const allUsers = db.users;
+
+  const missing = [];
+  const found = [];
+
+  for (const ident of identifiers) {
+    if (typeof ident !== "string") {
+      missing.push(String(ident));
+      continue;
+    }
+    let u = null;
+    if (ident.startsWith("u_")) {
+      u = allUsers.find((user) => user.id === ident);
+    } else {
+      u = allUsers.find(
+        (user) => user.username.toLowerCase() === String(ident).toLowerCase()
+      );
+    }
+    if (!u) {
+      missing.push(ident);
+    } else {
+      found.push({ id: u.id, username: u.username });
+    }
+  }
+
+  if (missing.length) {
+    return res
+      .status(400)
+      .json({ error: `Users not found: ${missing.join(", ")}` });
+  }
+
+  res.json({ users: found });
 });
 
 app.get("*", (req, res) => {

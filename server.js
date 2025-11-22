@@ -99,7 +99,7 @@ async function githubRequest(path, options = {}) {
 
 async function loadDB() {
   if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
-    return { users: [], chats: [], messages: [], calls: [] };
+    return { users: [], chats: [], messages: [], calls: [], globalPaused: { messages: false, calls: false } };
   }
 
   try {
@@ -116,19 +116,21 @@ async function loadDB() {
     if (!Array.isArray(json.chats)) json.chats = [];
     if (!Array.isArray(json.messages)) json.messages = [];
     if (!Array.isArray(json.calls)) json.calls = [];
+    if (!json.globalPaused || typeof json.globalPaused !== "object")
+      json.globalPaused = { messages: false, calls: false };
 
     return json;
   } catch (err) {
     if (String(err.message).includes("404")) {
-      return { users: [], chats: [], messages: [], calls: [] };
+      return { users: [], chats: [], messages: [], calls: [], globalPaused: { messages: false, calls: false } };
     }
     console.error("Failed to load DB from GitHub:", err);
-    return { users: [], chats: [], messages: [], calls: [] };
+    return { users: [], chats: [], messages: [], calls: [], globalPaused: { messages: false, calls: false } };
   }
 }
 
 async function saveDB(db) {
-  if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) return;
+  if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) return false;
   const sha = db._sha;
   const payload = { ...db };
   delete payload._sha;
@@ -144,18 +146,25 @@ async function saveDB(db) {
   };
   if (sha) body.sha = sha;
 
-  const res = await githubRequest(
-    `/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(
-      DATA_PATH
-    )}`,
-    {
-      method: "PUT",
-      body: JSON.stringify(body)
-    }
-  );
+  try {
+    const res = await githubRequest(
+      `/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(
+        DATA_PATH
+      )}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(body)
+      }
+    );
 
-  if (res && res.content && res.content.sha) {
-    db._sha = res.content.sha;
+    if (res && res.content && res.content.sha) {
+      db._sha = res.content.sha;
+    }
+    return true;
+  } catch (err) {
+    console.error("Failed to save DB to GitHub:", err);
+    // Don't throw to avoid turning API calls into 5xx when GitHub is unavailable.
+    return false;
   }
 }
 
@@ -298,28 +307,35 @@ app.post("/api/chats", requireAuth, async (req, res) => {
   const currentUserId = req.session.userId;
   participantIds.push(currentUserId);
 
-  for (const pid of participants) {
-    // accept either a username (string) or a Talky user id like "u_abc123"
-    if (typeof pid !== "string") {
-      return res.status(400).json({ error: `Invalid participant value: ${String(pid)}` });
+  // Resolve each participant entry: if it looks like an id (u_...) validate directly,
+  // otherwise treat as username and resolve to id.
+  const missing = [];
+  for (const p of participants) {
+    if (typeof p !== "string") {
+      missing.push(String(p));
+      continue;
     }
+
     let u = null;
-    if (pid.startsWith("u_")) {
-      u = allUsers.find((user) => user.id === pid);
-      if (!u) {
-        return res.status(400).json({ error: `User ID not found: ${pid}` });
-      }
+    if (p.startsWith("u_")) {
+      u = allUsers.find((user) => user.id === p);
+      if (!u) missing.push(p);
     } else {
       u = allUsers.find(
-        (user) => user.username.toLowerCase() === String(pid).toLowerCase()
+        (user) => user.username.toLowerCase() === p.toLowerCase()
       );
-      if (!u) {
-        return res.status(400).json({ error: `User not found: ${pid}` });
-      }
+      if (!u) missing.push(p);
     }
-    if (!participantIds.includes(u.id)) {
+
+    if (u && !participantIds.includes(u.id)) {
       participantIds.push(u.id);
     }
+  }
+
+  if (missing.length) {
+    return res
+      .status(400)
+      .json({ error: `User(s) not found: ${missing.join(", ")}` });
   }
 
   const type = participantIds.length > 2 ? "group" : "dm";
@@ -337,11 +353,13 @@ app.post("/api/chats", requireAuth, async (req, res) => {
   };
 
   db.chats.push(chat);
+  // attempt to save, but don't fail the request if GitHub is unavailable
   await saveDB(db);
 
   res.status(201).json({ chat });
 });
 
+// Messages endpoint: check global pause
 app.post("/api/messages", requireAuth, async (req, res) => {
   const { chatId, ciphertext, iv } = req.body || {};
   if (!chatId || !ciphertext || !iv) {
@@ -349,6 +367,11 @@ app.post("/api/messages", requireAuth, async (req, res) => {
   }
 
   const db = await loadDB();
+
+  if (db.globalPaused && db.globalPaused.messages && !req.session.isAdmin) {
+    return res.status(503).json({ error: "Messaging is currently disabled by admin." });
+  }
+
   const chat = db.chats.find((c) => c.id === chatId);
   const userId = req.session.userId;
 
@@ -370,6 +393,7 @@ app.post("/api/messages", requireAuth, async (req, res) => {
   res.status(201).json({ message: msg });
 });
 
+// Calls endpoint: check global pause
 app.post("/api/calls", requireAuth, async (req, res) => {
   const { toUsername, type, chatId } = req.body || {};
   if (!toUsername || !type) {
@@ -380,8 +404,13 @@ app.post("/api/calls", requireAuth, async (req, res) => {
   }
 
   const db = await loadDB();
+
+  if (db.globalPaused && db.globalPaused.calls && !req.session.isAdmin) {
+    return res.status(503).json({ error: "Calling is currently disabled by admin." });
+  }
+
   const toUser = db.users.find(
-    (u) => u.username.toLowerCase() === String(toUsername).toLowerCase()
+    (u) => u.username.toLowerCase() === String(toUsername).toLowerCase() || u.id === String(toUsername)
   );
   if (!toUser) {
     return res.status(400).json({ error: "Target user not found." });
@@ -403,146 +432,116 @@ app.post("/api/calls", requireAuth, async (req, res) => {
   res.status(201).json({ call });
 });
 
-app.get("/api/calls/pending", requireAuth, async (req, res) => {
+// Chat management endpoints: rename, clear messages, delete, set-key in-place, rotate(create new & delete old)
+app.post("/api/chats/:id/rename", requireAuth, async (req, res) => {
+  const chatId = req.params.id;
+  const { name } = req.body || {};
+  if (!name) return res.status(400).json({ error: "New name required." });
   const db = await loadDB();
+  const chat = db.chats.find((c) => c.id === chatId);
   const userId = req.session.userId;
-  const now = Date.now();
-
-  db.calls = db.calls.filter((c) => {
-    const age = now - new Date(c.createdAt).getTime();
-    return age < 60 * 60 * 1000;
-  });
-
+  if (!chat || !(chat.participantIds || []).includes(userId)) {
+    return res.status(404).json({ error: "Chat not found." });
+  }
+  chat.name = String(name).slice(0, 200);
   await saveDB(db);
-
-  const pending = db.calls.filter(
-    (c) => c.toUserId === userId && c.status === "ringing"
-  );
-  res.json({ calls: pending });
+  res.json({ chat });
 });
 
-app.post("/api/calls/:id/accept", requireAuth, async (req, res) => {
-  const callId = req.params.id;
+app.post("/api/chats/:id/clear", requireAuth, async (req, res) => {
+  const chatId = req.params.id;
   const db = await loadDB();
-  const call = db.calls.find((c) => c.id === callId);
+  const chat = db.chats.find((c) => c.id === chatId);
   const userId = req.session.userId;
-
-  if (!call) return res.status(404).json({ error: "Call not found." });
-  if (call.toUserId !== userId) {
-    return res.status(403).json({ error: "Not your call to accept." });
+  if (!chat || !(chat.participantIds || []).includes(userId)) {
+    return res.status(404).json({ error: "Chat not found." });
   }
-
-  call.status = "connected";
-  call.updatedAt = new Date().toISOString();
-  await saveDB(db);
-  res.json({ call });
-});
-
-app.post("/api/calls/:id/decline", requireAuth, async (req, res) => {
-  const callId = req.params.id;
-  const db = await loadDB();
-  const call = db.calls.find((c) => c.id === callId);
-  const userId = req.session.userId;
-
-  if (!call) return res.status(404).json({ error: "Call not found." });
-  if (call.toUserId !== userId && call.fromUserId !== userId) {
-    return res.status(403).json({ error: "Not your call." });
-  }
-
-  call.status = "ended";
-  call.updatedAt = new Date().toISOString();
-  await saveDB(db);
-  res.json({ call });
-});
-
-app.post("/api/admin/login", async (req, res) => {
-  const { password } = req.body || {};
-  if (!password) {
-    return res.status(400).json({ error: "Password required." });
-  }
-  if (password !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: "Invalid admin password." });
-  }
-  req.session.isAdmin = true;
-  res.json({ ok: true });
-});
-
-app.get("/api/admin/users", requireAdmin, async (req, res) => {
-  const db = await loadDB();
-  res.json({
-    users: db.users.map((u) => ({
-      id: u.id,
-      username: u.username,
-      isAdmin: !!u.isAdmin,
-      createdAt: u.createdAt
-    }))
-  });
-});
-
-app.delete("/api/admin/users/:id", requireAdmin, async (req, res) => {
-  const userId = req.params.id;
-  const db = await loadDB();
-
-  const userIndex = db.users.findIndex((u) => u.id === userId);
-  if (userIndex === -1) {
-    return res.status(404).json({ error: "User not found." });
-  }
-
-  const chatsToDelete = db.chats
-    .filter((c) => (c.participantIds || []).includes(userId))
-    .map((c) => c.id);
-
-  db.users.splice(userIndex, 1);
-  db.chats = db.chats.filter((c) => !(c.participantIds || []).includes(userId));
-  db.messages = db.messages.filter((m) => !chatsToDelete.includes(m.chatId));
-  db.calls = db.calls.filter(
-    (call) => call.fromUserId !== userId && call.toUserId !== userId
-  );
-
+  db.messages = db.messages.filter((m) => m.chatId !== chatId);
   await saveDB(db);
   res.json({ ok: true });
 });
 
-// Resolve a list of usernames or user IDs to user objects (id + username)
-app.post("/api/users/lookup", requireAuth, async (req, res) => {
-  const { identifiers } = req.body || {};
-  if (!Array.isArray(identifiers) || !identifiers.length) {
-    return res.status(400).json({ error: "identifiers array required." });
+app.delete("/api/chats/:id", requireAuth, async (req, res) => {
+  const chatId = req.params.id;
+  const db = await loadDB();
+  const chatIndex = db.chats.findIndex((c) => c.id === chatId);
+  const userId = req.session.userId;
+  if (chatIndex === -1) return res.status(404).json({ error: "Chat not found." });
+  const chat = db.chats[chatIndex];
+  if (!(chat.participantIds || []).includes(userId)) {
+    return res.status(403).json({ error: "Not a participant." });
   }
+  db.chats.splice(chatIndex, 1);
+  db.messages = db.messages.filter((m) => m.chatId !== chatId);
+  await saveDB(db);
+  res.json({ ok: true });
+});
+
+// Set key in-place (update encryption.keyHash) - client will still keep raw code locally
+app.post("/api/chats/:id/set-key", requireAuth, async (req, res) => {
+  const chatId = req.params.id;
+  const { encryptionKeyHash } = req.body || {};
+  if (!encryptionKeyHash) return res.status(400).json({ error: "encryptionKeyHash required." });
+  const db = await loadDB();
+  const chat = db.chats.find((c) => c.id === chatId);
+  const userId = req.session.userId;
+  if (!chat || !(chat.participantIds || []).includes(userId)) {
+    return res.status(404).json({ error: "Chat not found." });
+  }
+  chat.encryption = chat.encryption || {};
+  chat.encryption.version = (chat.encryption && chat.encryption.version) || 1;
+  chat.encryption.keyHash = encryptionKeyHash;
+  chat.updatedAt = new Date().toISOString();
+  await saveDB(db);
+  res.json({ chat });
+});
+
+// Rotate key: create a new chat with same participants & name (new id), delete old chat + messages.
+// returns the new chat object. Clients should share the new code out-of-band.
+app.post("/api/chats/:id/rotate", requireAuth, async (req, res) => {
+  const chatId = req.params.id;
+  const { encryptionKeyHash } = req.body || {};
+  if (!encryptionKeyHash) return res.status(400).json({ error: "encryptionKeyHash required." });
 
   const db = await loadDB();
-  const allUsers = db.users;
-
-  const missing = [];
-  const found = [];
-
-  for (const ident of identifiers) {
-    if (typeof ident !== "string") {
-      missing.push(String(ident));
-      continue;
-    }
-    let u = null;
-    if (ident.startsWith("u_")) {
-      u = allUsers.find((user) => user.id === ident);
-    } else {
-      u = allUsers.find(
-        (user) => user.username.toLowerCase() === String(ident).toLowerCase()
-      );
-    }
-    if (!u) {
-      missing.push(ident);
-    } else {
-      found.push({ id: u.id, username: u.username });
-    }
+  const oldIndex = db.chats.findIndex((c) => c.id === chatId);
+  const userId = req.session.userId;
+  if (oldIndex === -1) return res.status(404).json({ error: "Chat not found." });
+  const oldChat = db.chats[oldIndex];
+  if (!(oldChat.participantIds || []).includes(userId)) {
+    return res.status(403).json({ error: "Not a participant." });
   }
 
-  if (missing.length) {
-    return res
-      .status(400)
-      .json({ error: `Users not found: ${missing.join(", ")}` });
-  }
+  const newChat = {
+    id: generateId("c"),
+    name: oldChat.name + " (rotated)",
+    type: oldChat.type,
+    participantIds: [...oldChat.participantIds],
+    encryption: {
+      version: (oldChat.encryption && oldChat.encryption.version) || 1,
+      keyHash: encryptionKeyHash
+    },
+    createdAt: new Date().toISOString()
+  };
 
-  res.json({ users: found });
+  // remove old chat and its messages
+  db.chats.splice(oldIndex, 1);
+  db.chats.push(newChat);
+  db.messages = db.messages.filter((m) => m.chatId !== chatId);
+
+  await saveDB(db);
+  res.json({ chat: newChat });
+});
+
+// Admin: pause/unpause messaging or calls or both
+app.post("/api/admin/pause", requireAdmin, async (req, res) => {
+  const { pauseMessages, pauseCalls } = req.body || {};
+  const db = await loadDB();
+  db.globalPaused = db.globalPaused || { messages: false, calls: false };
+  if (typeof pauseMessages === "boolean") db.globalPaused.messages = pauseMessages;
+  if (typeof pauseCalls === "boolean") db.globalPaused.calls = pauseCalls;
+  await saveDB(db);
+  res.json({ globalPaused: db.globalPaused });
 });
 
 app.get("*", (req, res) => {

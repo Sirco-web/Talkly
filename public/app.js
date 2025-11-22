@@ -1,1697 +1,609 @@
 // app.js - Talky front-end (GitHub-backed, encrypted chats, call signaling)
 
-// Inject Video Call Styles
-const videoStyles = document.createElement('style');
-videoStyles.textContent = `
-  .video-call-wrapper {
-    position: relative;
-    width: 100%;
-    height: 100%;
-    min-height: 400px;
-    background: #000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
-    border-radius: 12px;
-  }
-  #remote-video {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-  #local-video {
-    position: absolute;
-    bottom: 16px;
-    right: 16px;
-    width: 160px;
-    height: 120px;
-    background: #333;
-    border: 2px solid rgba(255,255,255,0.3);
-    border-radius: 12px;
-    object-fit: cover;
-    cursor: grab;
-    z-index: 10;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-    transition: box-shadow 0.2s;
-  }
-  #local-video:active {
-    cursor: grabbing;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-  }
-  .call-overlay-controls {
-    position: absolute;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    display: flex;
-    gap: 16px;
-    z-index: 20;
-    background: rgba(0,0,0,0.6);
-    padding: 12px 24px;
-    border-radius: 999px;
-    backdrop-filter: blur(4px);
-  }
-  .call-overlay-controls button {
-    background: transparent;
-    border: none;
-    color: white;
-    font-size: 20px;
-    cursor: pointer;
-    padding: 8px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 44px;
-    height: 44px;
-    transition: background 0.2s;
-  }
-  .call-overlay-controls button:hover {
-    background: rgba(255,255,255,0.2);
-  }
-  .call-overlay-controls button.hangup {
-    background: #ff4d4f;
-  }
-  .call-overlay-controls button.hangup:hover {
-    background: #ff7875;
-  }
-`;
-document.head.appendChild(videoStyles);
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
-// ---------- Element refs ----------
-const authScreen = document.getElementById("auth-screen");
-const mainScreen = document.getElementById("main-screen");
-
-const tabLogin = document.getElementById("tab-login");
-const tabSignup = document.getElementById("tab-signup");
-const loginPanel = document.getElementById("auth-login-panel");
-const signupPanel = document.getElementById("auth-signup-panel");
-
-const loginUsernameInput = document.getElementById("login-username");
-const loginPasswordInput = document.getElementById("login-password");
-const signupUsernameInput = document.getElementById("signup-username");
-const signupPasswordInput = document.getElementById("signup-password");
-
-const loginErrorEl = document.getElementById("auth-login-error");
-const signupErrorEl = document.getElementById("auth-signup-error");
-
-const btnLogin = document.getElementById("btn-login");
-const btnSignup = document.getElementById("btn-signup");
-const btnLogout = document.getElementById("btn-logout");
-
-const headerUsername = document.getElementById("header-username");
-const headerUserId = document.getElementById("header-userid");
-
-const chatItemsEl = document.getElementById("chat-items");
-const chatSearchInput = document.getElementById("chat-search-input");
-const chatDetailName = document.getElementById("chat-detail-name");
-const chatDetailPresence = document.getElementById("chat-detail-presence");
-const chatMessages = document.getElementById("chat-messages");
-const chatInput = document.getElementById("chat-input");
-const btnChatSend = document.getElementById("btn-chat-send");
-const btnNewChat = document.getElementById("btn-new-chat");
-const chatCallTarget = document.getElementById("chat-call-target");
-
-const videoCallBtn = document.getElementById("btn-video-call");
-const audioCallBtn = document.getElementById("btn-audio-call");
-const callOverlay = document.getElementById("call-overlay");
-const callDialogBody = document.getElementById("call-dialog-body");
-const callDialogTitle = document.getElementById("call-dialog-title");
-const callDialogClose = document.getElementById("call-dialog-close");
-
-const adminOverlay = document.getElementById("admin-overlay");
-const adminBody = document.getElementById("admin-body");
-const adminClose = document.getElementById("admin-close");
-
-// ---------- State ----------
-let currentUser = null;
-let chats = [];
-let messagesByChat = {};
-let activeChatId = null;
-let isAdminOpen = false;
-let pendingCallPollTimer = null;
-
-// local chat key cache (chatId -> { code })
-let chatKeyCache = {};
-
-// ---------- Utilities ----------
+// --- Utilities & Crypto ---
 async function jsonFetch(url, options = {}) {
-  const res = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
-    credentials: "same-origin",
-    ...options
-  });
-  let data;
-  try {
-    data = await res.json();
-  } catch {
-    data = null;
-  }
-  if (!res.ok) {
-    const msg = (data && data.error) || `Request failed (${res.status})`;
-    const err = new Error(msg);
-    err.status = res.status;
-    throw err;
-  }
+  const res = await fetch(url, { headers: { "Content-Type": "application/json" }, credentials: "same-origin", ...options });
+  let data; try { data = await res.json(); } catch { data = null; }
+  if (!res.ok) { const msg = (data && data.error) || `Request failed (${res.status})`; throw new Error(msg); }
   return data;
 }
 
-function show(el) {
-  el.classList.remove("hidden");
-}
-function hide(el) {
-  el.classList.add("hidden");
-}
-
-function switchAuthTab(tab) {
-  if (tab === "login") {
-    tabLogin.classList.add("active");
-    tabSignup.classList.remove("active");
-    show(loginPanel);
-    hide(signupPanel);
-  } else {
-    tabSignup.classList.add("active");
-    tabLogin.classList.remove("active");
-    show(signupPanel);
-    hide(loginPanel);
-  }
-  loginErrorEl.textContent = "";
-  signupErrorEl.textContent = "";
-}
-
-tabLogin.addEventListener("click", () => switchAuthTab("login"));
-tabSignup.addEventListener("click", () => switchAuthTab("signup"));
-
-// ---------- Chat key helpers (SHA-based code -> AES key) ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-
-function loadChatKeyCache() {
-  try {
-    const raw = localStorage.getItem("talky_chat_keys");
-    if (!raw) {
-      chatKeyCache = {};
-      return;
-    }
-    chatKeyCache = JSON.parse(raw);
-  } catch {
-    chatKeyCache = {};
-  }
+function bufToBase64(buf) {
+  let binary = ""; const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
-
-function saveChatKeyCache() {
-  localStorage.setItem("talky_chat_keys", JSON.stringify(chatKeyCache));
+function base64ToBuf(b64) {
+  const binary = atob(b64); const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
 }
-
-// Generate a human-ish code: groups of letters + emojis
-function generateChatKeyCode() {
-  const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const emojis = ["😀", "😎", "✨", "🔥", "🌙", "⭐", "🎧", "📞", "💬", "🔒"];
-  function randChars(len) {
-    let out = "";
-    for (let i = 0; i < len; i++) {
-      const idx = Math.floor(Math.random() * letters.length);
-      out += letters[idx];
-    }
-    return out;
-  }
-  let code = `${randChars(4)}-${randChars(4)}-${randChars(4)}-${randChars(4)}`;
-  const e1 = emojis[Math.floor(Math.random() * emojis.length)];
-  const e2 = emojis[Math.floor(Math.random() * emojis.length)];
-  code += ` ${e1}${e2}`;
-  return code;
-}
-
 async function deriveKeyBytesFromCode(code) {
   const digest = await crypto.subtle.digest("SHA-256", enc.encode(code));
   return new Uint8Array(digest);
 }
-
-function bytesToHex(bytes) {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-function bufToBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-function base64ToBuf(b64) {
-  const binary = atob(b64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
-
 async function getAesKeyFromCode(code) {
   const keyBytes = await deriveKeyBytesFromCode(code);
-  return crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, [
-    "encrypt",
-    "decrypt"
-  ]);
+  return crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
-
-async function encryptMessageForChat(chatId, plaintext) {
-  const entry = chatKeyCache[chatId];
-  if (!entry || !entry.code) {
-    throw new Error("Missing chat key code for this chat.");
-  }
-  const key = await getAesKeyFromCode(entry.code);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertextBuf = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    enc.encode(plaintext)
-  );
-  return {
-    ciphertext: bufToBase64(ciphertextBuf),
-    iv: bufToBase64(iv.buffer)
-  };
+function generateChatKeyCode() {
+  const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const emojis = ["😀", "😎", "✨", "🔥", "🌙", "⭐", "🎧", "📞", "💬", "🔒"];
+  const randChars = (len) => Array(len).fill(0).map(() => letters[Math.floor(Math.random() * letters.length)]).join("");
+  return `${randChars(4)}-${randChars(4)}-${randChars(4)}-${randChars(4)} ${emojis[Math.floor(Math.random()*emojis.length)]}${emojis[Math.floor(Math.random()*emojis.length)]}`;
 }
+function bytesToHex(bytes) { return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join(""); }
 
-async function decryptMessageForChat(chat, message) {
-  const entry = chatKeyCache[chat.id];
-  if (!entry || !entry.code) {
-    throw new Error("Missing chat key code");
-  }
-  const key = await getAesKeyFromCode(entry.code);
-  try {
-    const ivBuf = base64ToBuf(message.iv);
-    const cipherBuf = base64ToBuf(message.ciphertext);
-    const plainBuf = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: new Uint8Array(ivBuf) },
-      key,
-      cipherBuf
-    );
-    return dec.decode(plainBuf);
-  } catch (e) {
-    throw new Error("Decryption failed");
-  }
-}
-
-// ---------- Remember-username state ----------
-const REMEMBER_KEY = "talky_remember_username";
-let rememberUsername = true; // default on
-
-function loadRememberedUsername() {
-  try {
-    const stored = localStorage.getItem(REMEMBER_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      if (parsed && typeof parsed.username === "string") {
-        loginUsernameInput.value = parsed.username;
-      }
-      if (typeof parsed.remember === "boolean") {
-        rememberUsername = parsed.remember;
-      }
-    }
-  } catch {
-    // ignore
-  }
-}
-
-function saveRememberedUsername(username) {
-  try {
-    if (!rememberUsername) {
-      localStorage.removeItem(REMEMBER_KEY);
-      return;
-    }
-    localStorage.setItem(
-      REMEMBER_KEY,
-      JSON.stringify({ username, remember: true })
-    );
-  } catch {
-    // ignore
-  }
-}
-
-// Call once early
-loadRememberedUsername();
-
-// ---------- Auth flow ----------
-async function refreshMe() {
-  try {
-    const res = await jsonFetch("/api/me");
-    currentUser = res.user;
-    if (currentUser) {
-      headerUsername.textContent = currentUser.username;
-      headerUserId.textContent = `ID: ${currentUser.id}`;
-      
-      // remove any stray overlays before showing main UI
-      try { closeCallOverlay(); } catch {}
-      document.querySelectorAll(".modal-overlay").forEach((el) => el.remove());
-
-      hide(authScreen);
-      show(mainScreen);
-      loadChatKeyCache();
-      startPendingCallPolling();
-      await loadChats();
-    } else {
-      // remove overlays that may block the auth screen
-      try { closeCallOverlay(); } catch {}
-      document.querySelectorAll(".modal-overlay").forEach((el) => el.remove());
-
-      show(authScreen);
-      hide(mainScreen);
-      stopPendingCallPolling();
-    }
-  } catch (err) {
-    console.error("Failed to refresh /api/me:", err);
-    
-    // Ensure overlays don't block the auth screen on error
-    try { closeCallOverlay(); } catch {}
-    document.querySelectorAll(".modal-overlay").forEach((el) => el.remove());
-
-    show(authScreen);
-    hide(mainScreen);
-    stopPendingCallPolling();
-  }
-}
-
-btnSignup.addEventListener("click", async () => {
-  signupErrorEl.textContent = "";
-  const username = signupUsernameInput.value.trim();
-  const password = signupPasswordInput.value;
-
-  if (!username || !password) {
-    signupErrorEl.textContent = "Please fill out all fields.";
-    return;
-  }
-
-  try {
-    const res = await jsonFetch("/api/auth/signup", {
-      method: "POST",
-      body: JSON.stringify({ username, password })
-    });
-    currentUser = res.user;
-    headerUsername.textContent = currentUser.username;
-    headerUserId.textContent = `ID: ${currentUser.id}`;
-    // remember the username for next time
-    saveRememberedUsername(username);
-    signupUsernameInput.value = "";
-    signupPasswordInput.value = "";
-    loadChatKeyCache();
-    startPendingCallPolling();
-    await loadChats();
-    hide(authScreen);
-    show(mainScreen);
-  } catch (err) {
-    console.error("Signup failed:", err);
-    signupErrorEl.textContent = err.message;
-  }
-});
-
-btnLogin.addEventListener("click", async () => {
-  loginErrorEl.textContent = "";
-  const username = loginUsernameInput.value.trim();
-  const password = loginPasswordInput.value;
-
-  if (!username || !password) {
-    loginErrorEl.textContent = "Please fill out all fields.";
-    return;
-  }
-
-  try {
-    const res = await jsonFetch("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({ username, password })
-    });
-    currentUser = res.user;
-    headerUsername.textContent = currentUser.username;
-    headerUserId.textContent = `ID: ${currentUser.id}`;
-    // save username so next time you only type password
-    saveRememberedUsername(username);
-    loginPasswordInput.value = "";
-    loadChatKeyCache();
-    startPendingCallPolling();
-    await loadChats();
-    hide(authScreen);
-    show(mainScreen);
-  } catch (err) {
-    console.error("Login failed:", err);
-    loginErrorEl.textContent = err.message;
-  }
-});
-
-btnLogout.addEventListener("click", async () => {
-  try {
-    await jsonFetch("/api/auth/logout", { method: "POST" });
-  } catch {}
-  currentUser = null;
-  chats = [];
-  messagesByChat = {};
-  activeChatId = null;
-  chatItemsEl.innerHTML = "";
-  chatMessages.innerHTML = "";
-  stopPendingCallPolling();
-  show(authScreen);
-  hide(mainScreen);
-});
-
-// ---------- Chats + messages ----------
-async function loadChats() {
-  if (!currentUser) return;
-  try {
-    const res = await jsonFetch("/api/chats");
-    chats = res.chats || [];
-    messagesByChat = res.messagesByChat || {};
-    renderChatList();
-    if (activeChatId) {
-      const chat = chats.find((c) => c.id === activeChatId);
-      if (chat) {
-        renderChatDetail(chat);
-        return;
-      }
-    }
-    renderChatDetail(null);
-  } catch (err) {
-    console.error("Failed to load chats:", err);
-    chatItemsEl.innerHTML =
-      "<div style='padding:10px;font-size:12px;color:#b00'>Failed to load chats.</div>";
-  }
-}
-
-function renderChatList() {
-  chatItemsEl.innerHTML = "";
-  const q = chatSearchInput.value.trim().toLowerCase();
-
-  const visible = chats.filter((c) => {
-    if (!q) return true;
-    return c.name.toLowerCase().includes(q);
-  });
-
-  if (!visible.length) {
-    const empty = document.createElement("div");
-    empty.style.padding = "12px";
-    empty.style.fontSize = "12px";
-    empty.style.color = "#a0a0a6";
-    empty.textContent = "No chats yet. Tap “New chat” to create one.";
-    chatItemsEl.appendChild(empty);
-    return;
-  }
-
-  visible.forEach((chat) => {
-    const item = document.createElement("div");
-    item.className = "chat-item" + (chat.id === activeChatId ? " active" : "");
-    item.dataset.chatId = chat.id;
-
-    const avatar = document.createElement("div");
-    avatar.className = "chat-avatar";
-    avatar.textContent = chat.name
-      .split(" ")
-      .map((p) => p[0])
-      .join("")
-      .slice(0, 2)
-      .toUpperCase();
-
-    const textContainer = document.createElement("div");
-    textContainer.className = "chat-text";
-
-    const leftCol = document.createElement("div");
-    const nameEl = document.createElement("div");
-    nameEl.className = "chat-name";
-    nameEl.textContent = chat.name;
-    leftCol.appendChild(nameEl);
-
-    const rightCol = document.createElement("div");
-    rightCol.style.textAlign = "right";
-
-    const msgEl = document.createElement("div");
-    msgEl.className = "chat-last-message";
-
-    const metaEl = document.createElement("div");
-    metaEl.className = "chat-meta";
-
-    const msgs = messagesByChat[chat.id] || [];
-    if (msgs.length) {
-      const last = msgs[msgs.length - 1];
-      msgEl.textContent = "[Encrypted message]";
-      metaEl.textContent = new Date(last.ts).toLocaleTimeString([], {
-        hour: "numeric",
-        minute: "2-digit"
-      });
-    } else {
-      msgEl.textContent = "No messages yet";
-      metaEl.textContent = "";
-    }
-
-    rightCol.appendChild(msgEl);
-    rightCol.appendChild(metaEl);
-
-    textContainer.appendChild(leftCol);
-    textContainer.appendChild(rightCol);
-
-    item.appendChild(avatar);
-    item.appendChild(textContainer);
-
-    item.addEventListener("click", () => {
-      activeChatId = chat.id;
-      renderChatList();
-      renderChatDetail(chat);
-    });
-
-    chatItemsEl.appendChild(item);
-  });
-}
-
-async function renderMessages(chat) {
-  chatMessages.innerHTML = "";
-  const messages = messagesByChat[chat.id] || [];
-
-  if (!messages.length) {
-    const info = document.createElement("div");
-    info.style.fontSize = "12px";
-    info.style.color = "#777";
-    info.textContent = "No messages yet. Say hi!";
-    chatMessages.appendChild(info);
-    return;
-  }
-
-  let hasKey = !!(chatKeyCache[chat.id] && chatKeyCache[chat.id].code);
-
-  for (const m of messages) {
-    const row = document.createElement("div");
-    const isMe = currentUser && m.fromUserId === currentUser.id;
-    row.className = "msg-row " + (isMe ? "me" : "them");
-
-    const bubble = document.createElement("div");
-    bubble.className = "msg-bubble " + (isMe ? "me" : "them");
-
-    if (!hasKey) {
-      bubble.textContent = "🔒 Encrypted message (no chat key)";
-    } else {
-      try {
-        const text = await decryptMessageForChat(chat, m);
-        bubble.textContent = text;
-      } catch (e) {
-        bubble.textContent = "🔒 Unable to decrypt (key mismatch)";
-      }
-    }
-
-    row.appendChild(bubble);
-    chatMessages.appendChild(row);
-  }
-
-  chatMessages.scrollTop = chatMessages.scrollHeight;
-}
-
-// ---------- Settings (ringtone, volume) ----------
-const SETTINGS_KEY = "talky_settings";
-let talkySettings = { ringtone: "default", volume: 0.6 };
-try {
-  const raw = localStorage.getItem(SETTINGS_KEY);
-  if (raw) talkySettings = JSON.parse(raw);
-} catch {}
-
-// ---------- WebRTC State ----------
-let localStream = null;
-let peerConnection = null;
-let signalingInterval = null;
-let currentCallId = null;
-const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
-
-// ---------- Audio Helpers ----------
+// --- Audio Context ---
 let audioCtx = null;
 let toneNode = null;
 let toneGain = null;
-
-function ensureAudio() {
+function playTone(freq, type = "sine", vol = 0.5) {
+  if (toneNode) stopTone();
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (audioCtx.state === 'suspended') audioCtx.resume();
-}
-
-function playTone(freq, type = "sine") {
-  stopTone();
-  ensureAudio();
   toneNode = audioCtx.createOscillator();
   toneGain = audioCtx.createGain();
   toneNode.type = type;
   toneNode.frequency.value = freq;
-  toneGain.gain.value = talkySettings.volume;
+  toneGain.gain.value = vol;
   toneNode.connect(toneGain);
   toneGain.connect(audioCtx.destination);
   toneNode.start();
 }
-
-function playDialTone() { playTone(425); }
-function playRingtone() { playTone(880, "triangle"); } // Distinct ringtone
 function stopTone() {
   if (toneNode) { try { toneNode.stop(); } catch{} toneNode.disconnect(); toneNode = null; }
   if (toneGain) { toneGain.disconnect(); toneGain = null; }
 }
 
-// ---------- WebRTC Logic ----------
-async function startWebRTC(isCaller, callId, type) {
-  currentCallId = callId;
-  peerConnection = new RTCPeerConnection(rtcConfig);
+// --- Components ---
 
-  peerConnection.onicecandidate = (event) => {
-    if (event.candidate) sendSignal(callId, "candidate", event.candidate);
-  };
-
-  // As soon as we get remote stream, attach to #remote-video (full-screen)
-  peerConnection.ontrack = (event) => {
-    const remoteVid = document.getElementById("remote-video");
-    if (remoteVid) {
-      if (!remoteVid.srcObject) {
-        remoteVid.srcObject = event.streams[0];
-      }
-    }
-  };
-
-  try {
-    const constraints = { audio: true, video: type === "video" };
-    localStream = await navigator.mediaDevices.getUserMedia(constraints);
-
-    // attach local stream to corner video
-    const localVid = document.getElementById("local-video");
-    if (localVid) {
-      localVid.srcObject = localStream;
-      localVid.muted = true;
-    }
-
-    localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
-
-    if (isCaller) {
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
-      await sendSignal(callId, "offer", offer);
-    }
-    
-    startSignalingPolling(callId);
-  } catch (err) {
-    console.error("Media Error:", err);
-    alert("Could not access camera/microphone. Ensure you are on HTTPS or localhost.");
-  }
-}
-
-async function sendSignal(callId, type, data) {
-  await jsonFetch(`/api/calls/${encodeURIComponent(callId)}/signal`, {
-    method: "POST",
-    body: JSON.stringify({ type, data })
-  });
-}
-
-function startSignalingPolling(callId) {
-  if (signalingInterval) clearInterval(signalingInterval);
-  let lastSignalTs = Date.now();
-  
-  signalingInterval = setInterval(async () => {
-    try {
-      const res = await jsonFetch(`/api/calls/${encodeURIComponent(callId)}/signal?since=${lastSignalTs}`);
-      if (res.signals && res.signals.length) {
-        for (const sig of res.signals) {
-          lastSignalTs = Math.max(lastSignalTs, sig.ts);
-          await handleSignal(sig);
-        }
-      }
-    } catch (e) { console.error(e); }
-  }, 1000);
-}
-
-async function handleSignal(sig) {
-  if (!peerConnection) return;
-  if (sig.type === "offer") {
-    await peerConnection.setRemoteDescription(new RTCSessionDescription(sig.data));
-    const answer = await peerConnection.createAnswer();
-    await peerConnection.setLocalDescription(answer);
-    await sendSignal(currentCallId, "answer", answer);
-  } else if (sig.type === "answer") {
-    await peerConnection.setRemoteDescription(new RTCSessionDescription(sig.data));
-  } else if (sig.type === "candidate") {
-    await peerConnection.addIceCandidate(new RTCIceCandidate(sig.data));
-  }
-}
-
-function stopWebRTC() {
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-  }
-  if (peerConnection) {
-    peerConnection.close();
-    peerConnection = null;
-  }
-  if (signalingInterval) {
-    clearInterval(signalingInterval);
-    signalingInterval = null;
-  }
-  currentCallId = null;
-}
-
-// Request notification permission on first use
-async function ensureNotifications() {
-  if (!("Notification" in window)) return false;
-  if (Notification.permission === "granted") return true;
-  try {
-    const perm = await Notification.requestPermission();
-    return perm === "granted";
-  } catch {
-    return false;
-  }
-}
-
-// Show browser notification for incoming call/message
-function showNotification(title, body, onClick) {
-  try {
-    if (Notification.permission === "granted") {
-      const n = new Notification(title, { body, renotify: true });
-      if (onClick) n.onclick = onClick;
-    }
-  } catch {}
-}
-
-// Settings modal (open when clicking header username or settings button)
-headerUsername.style.cursor = "pointer";
-headerUsername.addEventListener("click", openSettingsModal);
-
-const btnSettings = document.getElementById("btn-settings");
-if (btnSettings) {
-  btnSettings.addEventListener("click", openSettingsModal);
-}
-
-function openSettingsModal() {
-  const { overlay, dialog } = createModalOverlay();
-
-  const header = document.createElement("div");
-  header.className = "modal-header";
-  const title = document.createElement("div");
-  title.className = "modal-title";
-  title.textContent = "Settings";
-  const closeBtn = document.createElement("button");
-  closeBtn.textContent = "✕";
-  closeBtn.className = "call-end-btn";
-  closeBtn.addEventListener("click", () => document.body.removeChild(overlay));
-  header.appendChild(title);
-  header.appendChild(closeBtn);
-
-  const body = document.createElement("div");
-  body.style.padding = "10px 0";
-
-  // Ringtone Row
-  const rowR = document.createElement("div");
-  rowR.className = "modal-row";
-  const lblR = document.createElement("div");
-  lblR.textContent = "Ringtone";
-  const sel = document.createElement("select");
-  ["default","dial","beep","chime"].forEach((v) => {
-    const o = document.createElement("option"); o.value = v; o.textContent = v; if (talkySettings.ringtone === v) o.selected = true;
-    sel.appendChild(o);
-  });
-  rowR.appendChild(lblR);
-  rowR.appendChild(sel);
-
-  // Volume Row
-  const rowV = document.createElement("div");
-  rowV.className = "modal-row";
-  const lblV = document.createElement("div");
-  lblV.textContent = "Volume";
-  const vol = document.createElement("input");
-  vol.type = "range"; vol.min = 0; vol.max = 1; vol.step = 0.01; vol.value = talkySettings.volume;
-  rowV.appendChild(lblV);
-  rowV.appendChild(vol);
-
-  body.appendChild(rowR);
-  body.appendChild(rowV);
-
-  // Test Button
-  const testBtn = document.createElement("button");
-  testBtn.className = "modal-menu-btn";
-  testBtn.textContent = "🔊 Test Ringtone";
-  testBtn.addEventListener("click", () => {
-    talkySettings.ringtone = sel.value;
-    talkySettings.volume = Number(vol.value);
-    saveSettings();
-    playRingtone();
-    setTimeout(stopTone, 800);
-  });
-  body.appendChild(testBtn);
-
-  const actions = document.createElement("div");
-  actions.className = "modal-actions";
-  const done = document.createElement("button");
-  done.className = "btn btn-primary";
-  done.textContent = "Save & Close";
-  done.addEventListener("click", async () => {
-    talkySettings.ringtone = sel.value;
-    talkySettings.volume = Number(vol.value);
-    saveSettings();
-    await ensureNotifications();
-    document.body.removeChild(overlay);
-  });
-  actions.appendChild(done);
-
-  dialog.appendChild(header);
-  dialog.appendChild(body);
-  dialog.appendChild(actions);
-  document.body.appendChild(overlay);
-}
-
-// ---------- Chat detail management UI ----------
-
-// Consolidated Chat Settings Modal (Replaces the cluttered button row)
-function openChatSettingsModal(chat) {
-  const { overlay, dialog } = createModalOverlay();
-  
-  const header = document.createElement("div");
-  header.className = "modal-header";
-  const title = document.createElement("div");
-  title.className = "modal-title";
-  title.textContent = "Manage Chat";
-  const closeBtn = document.createElement("button");
-  closeBtn.className = "call-end-btn";
-  closeBtn.textContent = "✕";
-  closeBtn.addEventListener("click", () => document.body.removeChild(overlay));
-  header.appendChild(title);
-  header.appendChild(closeBtn);
-
-  const body = document.createElement("div");
-  body.style.display = "flex";
-  body.style.flexDirection = "column";
-  body.style.gap = "8px";
-  body.style.padding = "16px 0";
-
-  // 1. Rename
-  const btnRename = document.createElement("button");
-  btnRename.className = "modal-menu-btn";
-  btnRename.textContent = "✏️ Rename Chat";
-  btnRename.addEventListener("click", async () => {
-    document.body.removeChild(overlay);
-    const newName = await showPrompt("Rename chat", "New chat name:", { placeholder: chat.name });
-    if (!newName) return;
-    try {
-      const res = await jsonFetch(`/api/chats/${encodeURIComponent(chat.id)}/rename`, {
-        method: "POST",
-        body: JSON.stringify({ name: newName })
-      });
-      const updated = res.chat;
-      const local = chats.find((c) => c.id === updated.id) || updated;
-      local.name = updated.name;
-      renderChatList();
-      renderChatDetail(updated);
-      await showAlert("Renamed", "Chat renamed.");
-    } catch (e) {
-      await showAlert("Error", e.message || "Rename failed.");
-    }
-  });
-
-  // 2. Import/View Key
-  const btnKey = document.createElement("button");
-  btnKey.className = "modal-menu-btn";
-  const hasKey = !!(chatKeyCache[chat.id] && chatKeyCache[chat.id].code);
-  btnKey.textContent = hasKey ? "🔑 View Chat Key" : "📥 Import Chat Key";
-  btnKey.addEventListener("click", async () => {
-    document.body.removeChild(overlay);
-    if (hasKey) {
-      showCopyableKeyModal("Current Chat Key", chatKeyCache[chat.id].code);
-    } else {
-      await importKeyForChat(chat);
-    }
-  });
-
-  // 3. Clear Messages
-  const btnClear = document.createElement("button");
-  btnClear.className = "modal-menu-btn";
-  btnClear.textContent = "🧹 Clear History";
-  btnClear.addEventListener("click", async () => {
-    document.body.removeChild(overlay);
-    const ok = await showConfirm("Clear messages", "Clear all messages in this chat? This cannot be undone.");
-    if (!ok) return;
-    try {
-      await jsonFetch(`/api/chats/${encodeURIComponent(chat.id)}/clear`, { method: "POST" });
-      messagesByChat[chat.id] = [];
-      renderMessages(chat);
-      renderChatList();
-      await showAlert("Cleared", "Messages cleared.");
-    } catch (e) {
-      await showAlert("Error", e.message || "Clear failed.");
-    }
-  });
-
-  // 4. Rotate Key
-  const btnRotate = document.createElement("button");
-  btnRotate.className = "modal-menu-btn";
-  btnRotate.textContent = "🔄 Rotate Key (Re-create Chat)";
-  btnRotate.addEventListener("click", async () => {
-    document.body.removeChild(overlay);
-    const ok = await showConfirm("Rotate key", "Rotate this chat key: a new chat will be created and the old chat deleted. Continue?");
-    if (!ok) return;
-    const code = generateChatKeyCode();
-    try {
-      const keyBytes = await deriveKeyBytesFromCode(code);
-      const hashHex = bytesToHex(keyBytes);
-      const res = await jsonFetch(`/api/chats/${encodeURIComponent(chat.id)}/rotate`, {
-        method: "POST",
-        body: JSON.stringify({ encryptionKeyHash: hashHex })
-      });
-      const newChat = res.chat;
-      if (!chatKeyCache[newChat.id]) chatKeyCache[newChat.id] = {};
-      chatKeyCache[newChat.id].code = code;
-      saveChatKeyCache();
-      chats = chats.filter((c) => c.id !== chat.id);
-      chats.push(newChat);
-      messagesByChat[newChat.id] = [];
-      activeChatId = newChat.id;
-      renderChatList();
-      renderChatDetail(newChat);
-      showCopyableKeyModal("New chat key", code);
-    } catch (e) {
-      await showAlert("Error", e.message || "Rotate failed.");
-    }
-  });
-
-  // 5. Delete Chat
-  const btnDelete = document.createElement("button");
-  btnDelete.className = "modal-menu-btn danger";
-  btnDelete.textContent = "🗑️ Delete Chat";
-  btnDelete.addEventListener("click", async () => {
-    document.body.removeChild(overlay);
-    const ok = await showConfirm("Delete chat", "Delete this chat and all messages? This cannot be undone.");
-    if (!ok) return;
-    try {
-      await jsonFetch(`/api/chats/${encodeURIComponent(chat.id)}`, { method: "DELETE" });
-      chats = chats.filter((c) => c.id !== chat.id);
-      delete messagesByChat[chat.id];
-      activeChatId = null;
-      renderChatList();
-      renderChatDetail(null);
-      await showAlert("Deleted", "Chat deleted.");
-    } catch (e) {
-      await showAlert("Error", e.message || "Delete failed.");
-    }
-  });
-
-  body.appendChild(btnRename);
-  body.appendChild(btnKey);
-  body.appendChild(btnClear);
-  body.appendChild(btnRotate);
-  body.appendChild(btnDelete);
-
-  dialog.appendChild(header);
-  dialog.appendChild(body);
-  document.body.appendChild(overlay);
-}
-
-// Ensure renderChatDetail uses only the single Manage button and does not leave duplicates
-async function renderChatDetail(chat) {
-  // Clean up any old manage/delete UI
-  const existingManage = document.getElementById("btn-chat-manage");
-  if (existingManage && existingManage.parentElement) {
-    existingManage.parentElement.removeChild(existingManage);
-  }
-  const oldRow = document.getElementById("chat-manage-row");
-  if (oldRow && oldRow.parentElement) oldRow.parentElement.removeChild(oldRow);
-  const oldDel = document.getElementById("btn-chat-delete");
-  if (oldDel && oldDel.parentElement) oldDel.parentElement.removeChild(oldDel);
-
-  if (!chat) {
-    chatDetailName.textContent = "Select a chat";
-    chatDetailPresence.textContent = "No conversation selected.";
-    chatCallTarget.textContent = "Talky ID will show here";
-    chatMessages.innerHTML = "";
-    const info = document.createElement("div");
-    info.style.fontSize = "12px";
-    info.style.color = "#777";
-    info.textContent = "Pick a chat on the left to see the conversation here.";
-    chatMessages.appendChild(info);
-    return;
-  }
-
-  chatDetailName.textContent = chat.name;
-
-  // Add a single "Manage" button on the right side of the header
-  const headerEl = chatDetailName.parentElement;
-  if (headerEl) {
-    let manageBtn = document.getElementById("btn-chat-manage");
-    if (!manageBtn) {
-      manageBtn = document.createElement("button");
-      manageBtn.id = "btn-chat-manage";
-      manageBtn.className = "btn-pill";
-      manageBtn.textContent = "Manage";
-      manageBtn.style.marginLeft = "auto";
-      manageBtn.addEventListener("click", () => openChatSettingsModal(chat));
-      headerEl.appendChild(manageBtn);
-    } else if (manageBtn.parentElement !== headerEl) {
-      manageBtn.parentElement.removeChild(manageBtn);
-      headerEl.appendChild(manageBtn);
-    } else {
-      // ensure it refers to the current chat
-      manageBtn.onclick = () => openChatSettingsModal(chat);
-    }
-  }
-
-  const others = (chat.participantIds || []).filter(
-    (id) => currentUser && id !== currentUser.id
+function Modal({ title, onClose, children }) {
+  return (
+    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal-dialog">
+        <div className="modal-header">
+          <div className="modal-title">{title}</div>
+          <button className="call-end-btn" onClick={onClose}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
   );
-  if (!others.length) {
-    chatDetailPresence.textContent = "Just you in this chat.";
-  } else {
-    chatDetailPresence.textContent =
-      chat.type === "group"
-        ? `Group chat with ${others.length} others.`
-        : "Direct chat.";
-  }
-
-  chatCallTarget.textContent = `Your Talky ID: ${currentUser ? currentUser.id : "?"}`;
-
-  const hasKey = !!(chatKeyCache[chat.id] && chatKeyCache[chat.id].code);
-  if (!hasKey) {
-    chatDetailPresence.textContent += " • 🔒 Locked (no key)";
-  }
-
-  await renderMessages(chat);
 }
 
-// ---------- Calls (signaling only) ----------
-function openCallOverlayLayout(callType, title, bodyContent) {
-  callDialogTitle.textContent =
-    callType === "video" ? "Video Call" : "Audio Call";
-  callDialogBody.innerHTML = "";
-  callDialogBody.appendChild(bodyContent);
-  callOverlay.classList.remove("hidden");
-}
+function AuthScreen({ onLogin }) {
+  const [tab, setTab] = useState('login');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
 
-function closeCallOverlay() {
-  callOverlay.classList.add("hidden");
-}
-
-callDialogClose.addEventListener("click", closeCallOverlay);
-callOverlay.addEventListener("click", (e) => {
-  if (e.target === callOverlay) {
-    closeCallOverlay();
-  }
-});
-
-function buildCallScreen(name, type, statusText, extraButtons = []) {
-  const screen = document.createElement("div");
-  screen.className = "call-screen";
-
-  if (type === "video" && (statusText.includes("Connected") || statusText.includes("In Call"))) {
-    const vidContainer = document.createElement("div");
-    vidContainer.className = "video-call-wrapper";
-    
-    const remoteVideo = document.createElement("video");
-    remoteVideo.id = "remote-video";
-    remoteVideo.autoplay = true;
-    remoteVideo.playsInline = true;
-    
-    const localVideo = document.createElement("video");
-    localVideo.id = "local-video";
-    localVideo.autoplay = true;
-    localVideo.playsInline = true;
-    localVideo.muted = true;
-
-    // Make local video draggable over the remote video, Google Meet style
-    let isDragging = false;
-    let startX, startY, initialLeft, initialTop;
-
-    localVideo.addEventListener('mousedown', (e) => {
-      isDragging = true;
-      startX = e.clientX;
-      startY = e.clientY;
-      const rect = localVideo.getBoundingClientRect();
-      const parentRect = vidContainer.getBoundingClientRect();
-      initialLeft = rect.left - parentRect.left;
-      initialTop = rect.top - parentRect.top;
-      localVideo.style.cursor = 'grabbing';
-      localVideo.style.bottom = 'auto';
-      localVideo.style.right = 'auto';
-      localVideo.style.left = `${initialLeft}px`;
-      localVideo.style.top = `${initialTop}px`;
-    });
-
-    document.addEventListener('mousemove', (e) => {
-      if (!isDragging) return;
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      localVideo.style.left = `${initialLeft + dx}px`;
-      localVideo.style.top = `${initialTop + dy}px`;
-    });
-
-    document.addEventListener('mouseup', () => {
-      isDragging = false;
-      if (localVideo) localVideo.style.cursor = 'grab';
-    });
-
-    vidContainer.appendChild(remoteVideo);
-    vidContainer.appendChild(localVideo);
-
-    const controls = document.createElement("div");
-    controls.className = "call-overlay-controls";
-    
-    const hangupBtn = document.createElement("button");
-    hangupBtn.className = "hangup";
-    hangupBtn.innerHTML = "✕";
-    hangupBtn.title = "End Call";
-    hangupBtn.addEventListener("click", () => {
-      stopTone();
-      stopWebRTC();
-      closeCallOverlay();
-    });
-    controls.appendChild(hangupBtn);
-
-    // allow extra buttons if needed in future
-    extraButtons.forEach((b) => controls.appendChild(b));
-
-    vidContainer.appendChild(controls);
-    screen.appendChild(vidContainer);
-  } else {
-    // ...existing audio-call UI...
-    const avatar = document.createElement("div");
-    avatar.className = "call-avatar";
-    avatar.textContent = name.slice(0, 2).toUpperCase();
-    screen.appendChild(avatar);
-    const nameEl = document.createElement("div");
-    nameEl.className = "call-name";
-    nameEl.textContent = name;
-    screen.appendChild(nameEl);
-    const statusEl = document.createElement("div");
-    statusEl.className = "call-status";
-    statusEl.textContent = statusText;
-    screen.appendChild(statusEl);
-    const buttonsRow = document.createElement("div");
-    buttonsRow.className = "call-buttons";
-    const endBtn = document.createElement("button");
-    endBtn.className = "call-end-btn";
-    endBtn.textContent = "✕";
-    endBtn.addEventListener("click", () => {
-      stopTone();
-      stopWebRTC();
-      closeCallOverlay();
-    });
-    buttonsRow.appendChild(endBtn);
-    extraButtons.forEach((b) => buttonsRow.appendChild(b));
-    screen.appendChild(buttonsRow);
-  }
-
-  return screen;
-}
-
-function openCallStartDialog(type) {
-  if (!currentUser) {
-    alert("Log in first.");
-    return;
-  }
-
-  const container = document.createElement("div");
-  container.style.display = "flex";
-  container.style.flexDirection = "column";
-  container.style.gap = "10px";
-
-  const label1 = document.createElement("div");
-  label1.textContent = "Start a call with:";
-  label1.style.fontSize = "13px";
-
-  const select = document.createElement("select");
-  select.style.width = "100%";
-  select.style.padding = "6px";
-  select.style.borderRadius = "10px";
-  select.style.border = "1px solid #e5e5ea";
-  const optionNone = document.createElement("option");
-  optionNone.value = "";
-  optionNone.textContent = "— Pick from your chats —";
-  select.appendChild(optionNone);
-
-  chats.forEach((chat) => {
-    const others = (chat.participantIds || []).filter(
-      (id) => currentUser && id !== currentUser.id
-    );
-    if (!others.length) return;
-    const opt = document.createElement("option");
-    opt.value = chat.id;
-    opt.textContent = `${chat.name} (${chat.type === "group" ? "group" : "dm"})`;
-    select.appendChild(opt);
-  });
-
-  const orDiv = document.createElement("div");
-  orDiv.style.fontSize = "11px";
-  orDiv.style.color = "#999";
-  orDiv.textContent = "or call by username:";
-
-  const usernameInput = document.createElement("input");
-  usernameInput.type = "text";
-  usernameInput.placeholder = "Username (exact)";
-  usernameInput.style.width = "100%";
-  usernameInput.style.padding = "8px";
-  usernameInput.style.borderRadius = "10px";
-  usernameInput.style.border = "1px solid #e5e5ea";
-
-  const startBtn = document.createElement("button");
-  startBtn.className = "btn btn-primary";
-  startBtn.textContent = type === "video" ? "Start video call" : "Start audio call";
-  startBtn.style.marginTop = "4px";
-
-  // replace the click handler body to play dialing tone and stop when accepted/failed
-  startBtn.addEventListener("click", async () => {
-    let toUsername = usernameInput.value.trim();
-    let chatId = null;
-
-    if (!toUsername && select.value) {
-      const chat = chats.find((c) => c.id === select.value);
-      if (!chat) {
-        await showAlert("Error", "Chat not found.");
-        return;
-      }
-      const others = (chat.participantIds || []).filter(
-        (id) => currentUser && id !== currentUser.id
-      );
-      if (!others.length) {
-        await showAlert("Error", "This chat has no other users.");
-        return;
-      }
-      const picked = await showPrompt(
-        "Pick username",
-        "This chat may include multiple users. Enter the username you want to call from this chat:"
-      );
-      if (!picked) return;
-      toUsername = picked;
-      chatId = chat.id;
-    } else if (!toUsername && !select.value) {
-      alert("Select a chat or type a username.");
-      return;
+  useEffect(() => {
+    const saved = localStorage.getItem("talky_remember_username");
+    if (saved) {
+      try {
+        const p = JSON.parse(saved);
+        if (p.username) setUsername(p.username);
+      } catch {}
     }
+  }, []);
+
+  const handleSubmit = async () => {
+    if (!username || !password) return setError("Fill all fields");
+    setError("");
+    try {
+      const endpoint = tab === 'login' ? '/api/auth/login' : '/api/auth/signup';
+      const res = await jsonFetch(endpoint, { method: 'POST', body: JSON.stringify({ username, password }) });
+      localStorage.setItem("talky_remember_username", JSON.stringify({ username, remember: true }));
+      onLogin(res.user);
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  return (
+    <div id="auth-screen">
+      <div className="auth-card">
+        <div className="auth-logo">
+          <div className="auth-logo-mark">T</div>
+          <div className="auth-logo-title">Talky</div>
+          <div className="auth-logo-sub">Secure calling & messaging</div>
+        </div>
+        <div className="auth-tabs">
+          <div className={`auth-tab ${tab==='login'?'active':''}`} onClick={()=>setTab('login')}>Log In</div>
+          <div className={`auth-tab ${tab==='signup'?'active':''}`} onClick={()=>setTab('signup')}>Sign Up</div>
+        </div>
+        <div className="auth-panel">
+          <div className="field-row">
+            <div className="field-label">Username</div>
+            <input className="field-input" value={username} onChange={e=>setUsername(e.target.value)} />
+          </div>
+          <div className="field-row">
+            <div className="field-label">Password</div>
+            <input className="field-input" type="password" value={password} onChange={e=>setPassword(e.target.value)} />
+          </div>
+          <button className="btn-primary" onClick={handleSubmit}>{tab==='login'?'Log In':'Create Account'}</button>
+          <div className="auth-error">{error}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CallOverlay({ call, onClose, isIncoming }) {
+  const [status, setStatus] = useState(isIncoming ? "Incoming Call..." : "Calling...");
+  const [connected, setConnected] = useState(false);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const peerRef = useRef(null);
+  const pollRef = useRef(null);
+
+  // WebRTC Setup
+  const startWebRTC = useCallback(async (isCaller) => {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    peerRef.current = pc;
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) jsonFetch(`/api/calls/${call.id}/signal`, { method: 'POST', body: JSON.stringify({ type: 'candidate', data: e.candidate }) });
+    };
+    pc.ontrack = (e) => {
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = e.streams[0];
+    };
 
     try {
-      playDialTone();
-      const res = await jsonFetch("/api/calls", {
-        method: "POST",
-        body: JSON.stringify({ toUsername, type, chatId })
-      });
-      const call = res.call;
-      
-      const screen = buildCallScreen(toUsername, type, "Calling...");
-      openCallOverlayLayout(type, "Calling", screen);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.type === 'video' });
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        localVideoRef.current.muted = true;
+      }
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
+      if (isCaller) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await jsonFetch(`/api/calls/${call.id}/signal`, { method: 'POST', body: JSON.stringify({ type: 'offer', data: offer }) });
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Media access failed");
+    }
+  }, [call]);
+
+  // Polling for signals
+  useEffect(() => {
+    if (!connected) return;
+    let lastTs = Date.now();
+    const interval = setInterval(async () => {
+      try {
+        const res = await jsonFetch(`/api/calls/${call.id}/signal?since=${lastTs}`);
+        if (res.signals) {
+          for (const sig of res.signals) {
+            lastTs = Math.max(lastTs, sig.ts);
+            const pc = peerRef.current;
+            if (!pc) continue;
+            if (sig.type === 'offer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(sig.data));
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              await jsonFetch(`/api/calls/${call.id}/signal`, { method: 'POST', body: JSON.stringify({ type: 'answer', data: answer }) });
+            } else if (sig.type === 'answer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(sig.data));
+            } else if (sig.type === 'candidate') {
+              await pc.addIceCandidate(new RTCIceCandidate(sig.data));
+            }
+          }
+        }
+      } catch {}
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [connected, call.id]);
+
+  // Initial Call Logic
+  useEffect(() => {
+    if (isIncoming) {
+      playTone(880, 'triangle'); // Ringtone
+    } else {
+      playTone(425, 'sine'); // Dial tone
       // Poll for acceptance
-      const pollAccept = setInterval(async () => {
+      pollRef.current = setInterval(async () => {
         try {
-          const cRes = await jsonFetch(`/api/calls/${call.id}`);
-          if (cRes.call && cRes.call.status === "connected") {
-            clearInterval(pollAccept);
+          const res = await jsonFetch(`/api/calls/${call.id}`);
+          if (res.call.status === 'connected') {
+            clearInterval(pollRef.current);
             stopTone();
-            const inCallScreen = buildCallScreen(toUsername, type, "Connected");
-            openCallOverlayLayout(type, "In Call", inCallScreen);
-            startWebRTC(true, call.id, type); // Caller starts WebRTC
-          } else if (cRes.call && cRes.call.status === "ended") {
-            clearInterval(pollAccept);
+            setStatus("Connected");
+            setConnected(true);
+            startWebRTC(true);
+          } else if (res.call.status === 'ended') {
+            clearInterval(pollRef.current);
             stopTone();
-            closeCallOverlay();
-            alert("Call declined or ended.");
+            onClose();
+            alert("Call ended");
           }
         } catch {}
       }, 1000);
-
-    } catch (err) {
-      stopTone();
-      alert(err.message || "Failed to start call.");
     }
-  });
-
-  container.appendChild(label1);
-  container.appendChild(select);
-  container.appendChild(orDiv);
-  container.appendChild(usernameInput);
-  container.appendChild(startBtn);
-
-  openCallOverlayLayout(type, type === "video" ? "Video Call" : "Audio Call", container);
-}
-
-// Poll for incoming calls (play ringtone + show notification)
-async function pollPendingCalls() {
-  if (!currentUser) return;
-  try {
-    const res = await jsonFetch("/api/calls/pending");
-    const calls = res.calls || [];
-    if (!calls.length) return;
-    const call = calls[0];
-
-    // Avoid re-ringing for same call
-    if (currentCallId === call.id) return;
-
-    playRingtone();
-
-    const acceptBtn = document.createElement("button");
-    acceptBtn.className = "btn btn-primary";
-    acceptBtn.textContent = "Accept";
-    acceptBtn.addEventListener("click", async () => {
+    return () => {
       stopTone();
-      await jsonFetch(`/api/calls/${encodeURIComponent(call.id)}/accept`, { method: "POST" });
-      const inCallScreen = buildCallScreen(`User ${call.fromUserId}`, call.type, "Connected");
-      openCallOverlayLayout(call.type, "In Call", inCallScreen);
-      startWebRTC(false, call.id, call.type); // Callee starts WebRTC
-    });
+      if (pollRef.current) clearInterval(pollRef.current);
+      if (peerRef.current) peerRef.current.close();
+    };
+  }, []);
 
-    const declineBtn = document.createElement("button");
-    declineBtn.className = "btn-pill";
-    declineBtn.textContent = "Decline";
-    declineBtn.addEventListener("click", async () => {
-      stopTone();
-      await jsonFetch(`/api/calls/${encodeURIComponent(call.id)}/decline`, { method: "POST" });
-      closeCallOverlay();
-    });
-
-    const screen = buildCallScreen(`User ${call.fromUserId}`, call.type, "Incoming Call...", [acceptBtn, declineBtn]);
-    // Remove the default end button from buildCallScreen for incoming view if desired, or keep it
-    openCallOverlayLayout(call.type, "Incoming Call", screen);
-
-  } catch (err) { console.error(err); }
-}
-
-// ---------- integrate settings & tone stop on overlay close ----------
-callDialogClose.addEventListener("click", () => {
-  stopTone();
-  closeCallOverlay();
-});
-callOverlay.addEventListener("click", (e) => {
-  if (e.target === callOverlay) {
+  const handleAccept = async () => {
     stopTone();
-    closeCallOverlay();
-  }
-});
+    await jsonFetch(`/api/calls/${call.id}/accept`, { method: 'POST' });
+    setStatus("Connected");
+    setConnected(true);
+    startWebRTC(false);
+  };
 
-// ---------- Admin secret menu ----------
-document.addEventListener("keydown", async (e) => {
-  const onLoginScreen =
-    !authScreen.classList.contains("hidden") &&
-    mainScreen.classList.contains("hidden");
+  const handleHangup = async () => {
+    stopTone();
+    if (isIncoming && !connected) {
+      await jsonFetch(`/api/calls/${call.id}/decline`, { method: 'POST' });
+    }
+    // Clean up local stream
+    if (localVideoRef.current && localVideoRef.current.srcObject) {
+      localVideoRef.current.srcObject.getTracks().forEach(t => t.stop());
+    }
+    onClose();
+  };
 
-  if (
-    onLoginScreen &&
-    e.key.toLowerCase() === "z" &&
-    e.ctrlKey &&
-    e.altKey &&
-    e.shiftKey
-  ) {
-    e.preventDefault();
-    await openAdminMenu();
-  }
-});
+  // Draggable Video Logic
+  const dragRef = useRef({ isDragging: false, startX: 0, startY: 0, initialLeft: 0, initialTop: 0 });
+  const handleMouseDown = (e) => {
+    const vid = localVideoRef.current;
+    if (!vid) return;
+    dragRef.current.isDragging = true;
+    dragRef.current.startX = e.clientX;
+    dragRef.current.startY = e.clientY;
+    const rect = vid.getBoundingClientRect();
+    const parent = vid.parentElement.getBoundingClientRect();
+    dragRef.current.initialLeft = rect.left - parent.left;
+    dragRef.current.initialTop = rect.top - parent.top;
+    vid.style.cursor = 'grabbing';
+    vid.style.bottom = 'auto'; vid.style.right = 'auto';
+    vid.style.left = dragRef.current.initialLeft + 'px';
+    vid.style.top = dragRef.current.initialTop + 'px';
+  };
+  const handleMouseMove = (e) => {
+    if (!dragRef.current.isDragging) return;
+    const dx = e.clientX - dragRef.current.startX;
+    const dy = e.clientY - dragRef.current.startY;
+    if (localVideoRef.current) {
+      localVideoRef.current.style.left = (dragRef.current.initialLeft + dx) + 'px';
+      localVideoRef.current.style.top = (dragRef.current.initialTop + dy) + 'px';
+    }
+  };
+  const handleMouseUp = () => {
+    dragRef.current.isDragging = false;
+    if (localVideoRef.current) localVideoRef.current.style.cursor = 'grab';
+  };
 
-async function openAdminMenu() {
-  if (isAdminOpen) return;
+  useEffect(() => {
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
 
-  const pass = prompt("Enter admin password:");
-  if (!pass) return;
-
-  try {
-    await jsonFetch("/api/admin/login", {
-      method: "POST",
-      body: JSON.stringify({ password: pass })
-    });
-  } catch (err) {
-    alert(err.message || "Admin login failed.");
-    return;
-  }
-
-  isAdminOpen = true;
-  adminOverlay.classList.remove("hidden");
-  await loadAdminUsers();
+  return (
+    <div id="call-overlay">
+      <div className="call-dialog" style={connected && call.type === 'video' ? { width: '100%', maxWidth: '800px', background: 'transparent', boxShadow: 'none' } : {}}>
+        {!connected || call.type !== 'video' ? (
+          <div className="call-dialog-body">
+            <div className="call-screen">
+              <div className="call-avatar">U</div>
+              <div className="call-name">User {call.toUserId === call.fromUserId ? '...' : (isIncoming ? call.fromUserId : call.toUserId)}</div>
+              <div className="call-status">{status}</div>
+              <div className="call-buttons">
+                {isIncoming && !connected && <button className="btn btn-primary" onClick={handleAccept}>Accept</button>}
+                <button className="call-end-btn" onClick={handleHangup}>✕</button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="video-call-wrapper">
+            <video id="remote-video" ref={remoteVideoRef} autoPlay playsInline />
+            <video id="local-video" ref={localVideoRef} autoPlay playsInline muted onMouseDown={handleMouseDown} />
+            <div className="call-overlay-controls">
+              <button className="hangup" onClick={handleHangup}>✕</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
-adminClose.addEventListener("click", () => {
-  adminOverlay.classList.add("hidden");
-  isAdminOpen = false;
-});
+function App() {
+  const [user, setUser] = useState(null);
+  const [chats, setChats] = useState([]);
+  const [messages, setMessages] = useState({});
+  const [activeChatId, setActiveChatId] = useState(null);
+  const [chatKeys, setChatKeys] = useState({});
+  const [activeCall, setActiveCall] = useState(null); // { id, type, isIncoming }
+  const [modals, setModals] = useState({ settings: false, newChat: false, admin: false, manageChat: null });
+  const [inputText, setInputText] = useState("");
 
-adminOverlay.addEventListener("click", (e) => {
-  if (e.target === adminOverlay) {
-    adminOverlay.classList.add("hidden");
-    isAdminOpen = false;
-  }
-});
+  // Load Keys
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("talky_chat_keys");
+      if (raw) setChatKeys(JSON.parse(raw));
+    } catch {}
+  }, []);
+  const saveKeys = (newKeys) => {
+    setChatKeys(newKeys);
+    localStorage.setItem("talky_chat_keys", JSON.stringify(newKeys));
+  };
 
-async function loadAdminUsers() {
-  adminBody.innerHTML = "Loading users…";
-  try {
-    const res = await jsonFetch("/api/admin/users");
-    const users = res.users || [];
-    if (!users.length) {
-      adminBody.innerHTML =
-        "<div style='font-size:12px;color:#999'>No users yet.</div>";
+  // Initial Load
+  useEffect(() => {
+    jsonFetch('/api/me').then(res => {
+      if (res.user) {
+        setUser(res.user);
+        loadChats();
+      }
+    });
+  }, []);
+
+  // Polling for Calls
+  useEffect(() => {
+    if (!user) return;
+    const interval = setInterval(async () => {
+      try {
+        const res = await jsonFetch('/api/calls/pending');
+        if (res.calls && res.calls.length > 0 && !activeCall) {
+          setActiveCall({ ...res.calls[0], isIncoming: true });
+        }
+      } catch {}
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [user, activeCall]);
+
+  // Admin Shortcut
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key.toLowerCase() === 'z' && e.ctrlKey && e.altKey && e.shiftKey) {
+        e.preventDefault();
+        const pass = prompt("Admin Password:");
+        if (pass) jsonFetch('/api/admin/login', { method: 'POST', body: JSON.stringify({ password: pass }) })
+          .then(() => setModals(m => ({ ...m, admin: true })))
+          .catch(e => alert(e.message));
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  const loadChats = async () => {
+    try {
+      const res = await jsonFetch('/api/chats');
+      setChats(res.chats || []);
+      setMessages(res.messagesByChat || {});
+    } catch (e) { console.error(e); }
+  };
+
+  const handleSendMessage = async () => {
+    if (!inputText.trim() || !activeChatId) return;
+    const chat = chats.find(c => c.id === activeChatId);
+    if (!chat) return;
+    
+    const keyEntry = chatKeys[chat.id];
+    if (!keyEntry || !keyEntry.code) {
+      alert("No key for this chat. Import or create one.");
       return;
     }
-    const container = document.createElement("div");
-    users.forEach((u) => {
-      const row = document.createElement("div");
-      row.className = "admin-row";
 
-      const main = document.createElement("div");
-      main.className = "admin-user-main";
-
-      const name = document.createElement("div");
-      name.className = "admin-user-name";
-      name.textContent = `${u.username} (${u.id})`;
-
-      const meta = document.createElement("div");
-      meta.className = "admin-user-meta";
-      meta.textContent = `Joined: ${new Date(u.createdAt).toLocaleString()}`;
-
-      main.appendChild(name);
-      main.appendChild(meta);
-
-      const right = document.createElement("div");
-      right.style.display = "flex";
-      right.style.alignItems = "center";
-      right.style.gap = "6px";
-
-      if (u.isAdmin) {
-        const badge = document.createElement("span");
-        badge.className = "admin-badge-admin";
-        badge.textContent = "Admin";
-        right.appendChild(badge);
-      }
-
-      const delBtn = document.createElement("button");
-      delBtn.className = "admin-delete-btn";
-      delBtn.textContent = "Delete";
-      delBtn.addEventListener("click", async () => {
-        if (
-          !confirm(
-            `Delete user ${u.username}? This removes their chats, messages, and calls.`
-          )
-        ) {
-          return;
-        }
-        try {
-          await jsonFetch(`/api/admin/users/${encodeURIComponent(u.id)}`, {
-            method: "DELETE"
-          });
-          await loadAdminUsers();
-        } catch (err) {
-          alert(err.message || "Failed to delete user.");
-        }
-      });
-
-      right.appendChild(delBtn);
-
-      row.appendChild(main);
-      row.appendChild(right);
-      container.appendChild(row);
-    });
-    adminBody.innerHTML = "";
-    adminBody.appendChild(container);
-  } catch (err) {
-    console.error("Failed to load admin users:", err);
-    adminBody.innerHTML =
-      "<div style='font-size:12px;color:#b00'>Failed to load users.</div>";
-  }
-}
-
-// ---------- Init ----------
-switchAuthTab("login");
-refreshMe();
-
-// Ensure we request notification permission on startup for better UX
-(async () => {
-  try {
-    await ensureNotifications();
-  } catch {}
-})();
-
-// ---------- Polling helpers ----------
-function startPendingCallPolling() {
-  if (pendingCallPollTimer) clearInterval(pendingCallPollTimer);
-  pollPendingCalls(); // run immediately
-  pendingCallPollTimer = setInterval(pollPendingCalls, 3000);
-}
-
-function stopPendingCallPolling() {
-  if (pendingCallPollTimer) clearInterval(pendingCallPollTimer);
-  pendingCallPollTimer = null;
-}
-
-// ---------- Init & DOM wiring ----------
-
-function initApp() {
-  // Wire New Chat
-  const btnNewChatElm = document.getElementById("btn-new-chat");
-  if (btnNewChatElm) {
-    btnNewChatElm.onclick = (e) => {
-      e.preventDefault();
-      openNewChatModal();
-    };
-  }
-
-  // Wire send button + enter key
-  if (btnChatSend) {
-    btnChatSend.onclick = sendMessage;
-  }
-  if (chatInput) {
-    chatInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") sendMessage();
-    });
-  }
-
-  // Wire settings button (gear icon)
-  const settingsBtn = document.getElementById("btn-settings");
-  if (settingsBtn) {
-    settingsBtn.onclick = (e) => {
-      e.preventDefault();
-      openSettingsModal();
-    };
-  }
-
-  // Wire call buttons
-  if (videoCallBtn) {
-    videoCallBtn.onclick = () => openCallStartDialog("video");
-  }
-  if (audioCallBtn) {
-    audioCallBtn.onclick = () => openCallStartDialog("audio");
-  }
-}
-
-// Run init after DOM is ready
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", initApp);
-} else {
-  initApp();
-}
-
-// Keep existing bottom‑of‑file init:
-switchAuthTab("login");
-refreshMe();
-
-// ---------- Message sending (kept at bottom for logical flow) ----------
-async function sendMessage() {
-  const text = chatInput.value.trim();
-  if (!text || !activeChatId) return;
-
-  const chat = chats.find((c) => c.id === activeChatId);
-  if (!chat) return;
-
-  try {
-    // Encrypt
-    const { ciphertext, iv } = await encryptMessageForChat(chat.id, text);
-    
-    // Send
-    await jsonFetch("/api/messages", {
-      method: "POST",
-      body: JSON.stringify({ chatId: chat.id, ciphertext, iv })
-    });
-
-    chatInput.value = "";
-    await loadChats(); // Refresh UI
-  } catch (err) {
-    console.error(err);
-    await showAlert("Error", "Failed to send message: " + err.message);
-  }
-}
-
-async function openNewChatModal() {
-  console.log("Opening new chat modal...");
-  const { overlay, dialog } = createModalOverlay();
-  
-  const header = document.createElement("div");
-  header.className = "modal-header";
-  const title = document.createElement("div");
-  title.className = "modal-title";
-  title.textContent = "New Chat";
-  const closeBtn = document.createElement("button");
-  closeBtn.className = "call-end-btn";
-  closeBtn.textContent = "✕";
-  closeBtn.addEventListener("click", () => document.body.removeChild(overlay));
-  header.appendChild(title);
-  header.appendChild(closeBtn);
-
-  const body = document.createElement("div");
-  body.style.padding = "10px 0";
-  
-  // Name input
-  const row1 = document.createElement("div");
-  row1.className = "modal-row";
-  const lbl1 = document.createElement("div"); lbl1.textContent = "Chat Name";
-  const inpName = document.createElement("input"); inpName.type = "text"; inpName.placeholder = "e.g. Team Project";
-  row1.appendChild(lbl1); row1.appendChild(inpName);
-
-  // Participants input
-  const row2 = document.createElement("div");
-  row2.className = "modal-row";
-  const lbl2 = document.createElement("div"); lbl2.textContent = "Participants (usernames or IDs, comma separated)";
-  const inpPart = document.createElement("input"); inpPart.type = "text"; inpPart.placeholder = "alice, bob, u_12345";
-  row2.appendChild(lbl2); row2.appendChild(inpPart);
-
-  body.appendChild(row1);
-  body.appendChild(row2);
-
-  const actions = document.createElement("div");
-  actions.className = "modal-actions";
-  const createBtn = document.createElement("button");
-  createBtn.className = "btn btn-primary";
-  createBtn.textContent = "Create";
-  
-  createBtn.addEventListener("click", async () => {
-    const name = inpName.value.trim();
-    const rawPart = inpPart.value.trim();
-    if (!name) { alert("Name required"); return; }
-    if (!rawPart) { alert("Participants required"); return; }
-
-    const participants = rawPart.split(",").map(s => s.trim()).filter(Boolean);
-    
     try {
-      // 1. Generate key
-      const code = generateChatKeyCode();
-      const keyBytes = await deriveKeyBytesFromCode(code);
-      const hashHex = bytesToHex(keyBytes);
-
-      // 2. Create chat
-      const res = await jsonFetch("/api/chats", {
-        method: "POST",
-        body: JSON.stringify({ name, participants, encryptionKeyHash: hashHex })
+      const key = await getAesKeyFromCode(keyEntry.code);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ciphertextBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(inputText));
+      
+      await jsonFetch('/api/messages', {
+        method: 'POST',
+        body: JSON.stringify({
+          chatId: chat.id,
+          ciphertext: bufToBase64(ciphertextBuf),
+          iv: bufToBase64(iv.buffer)
+        })
       });
-
-      // 3. Save key locally
-      if (!chatKeyCache[res.chat.id]) chatKeyCache[res.chat.id] = {};
-      chatKeyCache[res.chat.id].code = code;
-      saveChatKeyCache();
-
-      // 4. Close & Refresh
-      document.body.removeChild(overlay);
-      await loadChats();
-      
-      // 5. Show key
-      showCopyableKeyModal("Chat Created", code);
-      
+      setInputText("");
+      loadChats();
     } catch (e) {
-      alert(e.message);
+      alert("Send failed: " + e.message);
     }
-  });
+  };
 
-  actions.appendChild(createBtn);
-  dialog.appendChild(header);
-  dialog.appendChild(body);
-  dialog.appendChild(actions);
-  document.body.appendChild(overlay);
-  
-  // Focus input
-  setTimeout(() => inpName.focus(), 50);
+  const decryptMessage = async (chatId, msg) => {
+    const keyEntry = chatKeys[chatId];
+    if (!keyEntry) return "🔒 Encrypted";
+    try {
+      const key = await getAesKeyFromCode(keyEntry.code);
+      const plain = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: new Uint8Array(base64ToBuf(msg.iv)) },
+        key,
+        base64ToBuf(msg.ciphertext)
+      );
+      return dec.decode(plain);
+    } catch { return "🔒 Decrypt Failed"; }
+  };
+
+  // Sub-components for rendering
+  const ChatMessage = ({ msg, chatId }) => {
+    const [text, setText] = useState("...");
+    useEffect(() => { decryptMessage(chatId, msg).then(setText); }, [msg, chatId, chatKeys]);
+    const isMe = msg.fromUserId === user.id;
+    return (
+      <div className={`msg-row ${isMe ? 'me' : 'them'}`}>
+        <div className={`msg-bubble ${isMe ? 'me' : 'them'}`}>{text}</div>
+      </div>
+    );
+  };
+
+  if (!user) return <AuthScreen onLogin={(u) => { setUser(u); loadChats(); }} />;
+
+  const activeChat = chats.find(c => c.id === activeChatId);
+  const activeMsgs = activeChatId ? (messages[activeChatId] || []) : [];
+
+  return (
+    <div id="main-screen">
+      {/* Top Bar */}
+      <div className="top-bar">
+        <div className="top-left">
+          <div className="top-app-name">Talky</div>
+          <div className="top-app-sub">React Frontend</div>
+        </div>
+        <div className="top-right">
+          <div className="user-pill">
+            <div className="user-pill-main">{user.username}</div>
+            <div className="user-pill-sub">ID: {user.id}</div>
+          </div>
+          <button className="btn-pill" onClick={() => setModals({ ...modals, settings: true })}>⚙️</button>
+          <button id="btn-logout" onClick={() => { jsonFetch('/api/auth/logout', { method: 'POST' }); setUser(null); }}>Log Out</button>
+        </div>
+      </div>
+
+      {/* Call Strip */}
+      <div className="call-strip">
+        <button className="call-button video" onClick={() => {
+          const target = prompt("Enter username to call:");
+          if (target) setActiveCall({ id: 'pending', type: 'video', toUserId: target, isIncoming: false });
+        }}>
+          <div className="icon-badge">🎥</div>
+          <span className="label"><span className="label-main">Video call</span></span>
+        </button>
+        <button className="call-button audio" onClick={() => {
+           const target = prompt("Enter username to call:");
+           if (target) setActiveCall({ id: 'pending', type: 'audio', toUserId: target, isIncoming: false });
+        }}>
+          <div className="icon-badge">📞</div>
+          <span className="label"><span className="label-main">Audio call</span></span>
+        </button>
+      </div>
+
+      {/* App Shell */}
+      <div className="app-shell">
+        <div className="panel panel-left">
+          <div className="panel-header">
+            <div className="panel-header-title">Chats</div>
+            <button className="btn-pill" onClick={() => setModals({ ...modals, newChat: true })}>New Chat</button>
+          </div>
+          <div className="chat-search"><input placeholder="Search chats" /></div>
+          <div id="chat-items">
+            {chats.map(chat => (
+              <div key={chat.id} className={`chat-item ${activeChatId === chat.id ? 'active' : ''}`} onClick={() => setActiveChatId(chat.id)}>
+                <div className="chat-avatar">{chat.name.slice(0, 2).toUpperCase()}</div>
+                <div className="chat-text">
+                  <div className="chat-name">{chat.name}</div>
+                  <div className="chat-last-message">Click to view</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel panel-right">
+          <div className="chat-detail-header">
+            <div className="chat-detail-name">{activeChat ? activeChat.name : "Select a chat"}</div>
+            {activeChat && (
+              <button className="btn-pill" style={{ marginLeft: 'auto' }} onClick={() => setModals({ ...modals, manageChat: activeChat })}>Manage</button>
+            )}
+          </div>
+          <div id="chat-messages">
+            {activeMsgs.map(m => <ChatMessage key={m.id} msg={m} chatId={activeChatId} />)}
+          </div>
+          <div className="chat-input-row">
+            <input value={inputText} onChange={e => setInputText(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSendMessage()} placeholder="Message" />
+            <button onClick={handleSendMessage}>Send</button>
+          </div>
+        </div>
+      </div>
+
+      {/* Modals */}
+      {activeCall && (
+        <CallOverlay 
+          call={activeCall.id === 'pending' ? { id: 'temp', ...activeCall } : activeCall} 
+          isIncoming={activeCall.isIncoming} 
+          onClose={() => setActiveCall(null)} 
+        />
+      )}
+
+      {modals.newChat && (
+        <Modal title="New Chat" onClose={() => setModals({ ...modals, newChat: false })}>
+          <div className="modal-row">
+            <div>Chat Name</div>
+            <input id="new-chat-name" placeholder="Team Project" />
+          </div>
+          <div className="modal-row">
+            <div>Participants (usernames, comma sep)</div>
+            <input id="new-chat-parts" placeholder="alice, bob" />
+          </div>
+          <div className="modal-actions">
+            <button className="btn-primary" onClick={async () => {
+              const name = document.getElementById('new-chat-name').value;
+              const parts = document.getElementById('new-chat-parts').value.split(',').map(s => s.trim()).filter(Boolean);
+              if (!name || !parts.length) return alert("Fields required");
+              const code = generateChatKeyCode();
+              const hash = bytesToHex(await deriveKeyBytesFromCode(code));
+              try {
+                const res = await jsonFetch('/api/chats', { method: 'POST', body: JSON.stringify({ name, participants: parts, encryptionKeyHash: hash }) });
+                saveKeys({ ...chatKeys, [res.chat.id]: { code } });
+                setModals({ ...modals, newChat: false });
+                loadChats();
+                alert(`Chat created! Key: ${code}`);
+              } catch (e) { alert(e.message); }
+            }}>Create</button>
+          </div>
+        </Modal>
+      )}
+
+      {modals.manageChat && (
+        <Modal title={`Manage ${modals.manageChat.name}`} onClose={() => setModals({ ...modals, manageChat: null })}>
+          <button className="modal-menu-btn" onClick={async () => {
+             const newName = prompt("New Name:");
+             if (newName) {
+               await jsonFetch(`/api/chats/${modals.manageChat.id}/rename`, { method: 'POST', body: JSON.stringify({ name: newName }) });
+               loadChats(); setModals({ ...modals, manageChat: null });
+             }
+          }}>✏️ Rename Chat</button>
+          <button className="modal-menu-btn" onClick={() => {
+             const code = chatKeys[modals.manageChat.id]?.code;
+             if (code) prompt("Copy Key:", code);
+             else {
+               const input = prompt("Enter Key:");
+               if (input) {
+                 saveKeys({ ...chatKeys, [modals.manageChat.id]: { code: input } });
+                 alert("Key saved");
+               }
+             }
+          }}>🔑 View/Import Key</button>
+          <button className="modal-menu-btn danger" onClick={async () => {
+             if (confirm("Delete chat?")) {
+               await jsonFetch(`/api/chats/${modals.manageChat.id}`, { method: 'DELETE' });
+               setActiveChatId(null); loadChats(); setModals({ ...modals, manageChat: null });
+             }
+          }}>🗑️ Delete Chat</button>
+        </Modal>
+      )}
+      
+      {modals.settings && (
+        <Modal title="Settings" onClose={() => setModals({ ...modals, settings: false })}>
+           <div className="modal-row"><div>Volume</div><input type="range" min="0" max="1" step="0.1" /></div>
+           <div className="modal-actions"><button className="btn-primary" onClick={() => setModals({ ...modals, settings: false })}>Save</button></div>
+        </Modal>
+      )}
+    </div>
+  );
 }
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);

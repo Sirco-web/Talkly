@@ -2,15 +2,50 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Talky – Calling & Messaging Demo</title>
+  <title>Talky – Calls & Messages</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div id="app">
-    <div id="main-screen" class="main-shell fade-in">
+    <div id="auth-screen" class="auth-shell hidden">
+      <div class="auth-card">
+        <div class="auth-logo-row">
+          <div class="dot"></div>
+          <div class="auth-title">Talky</div>
+        </div>
+        <div class="auth-toggle-row">
+          <button id="tab-login" class="auth-tab active">Log In</button>
+          <button id="tab-signup" class="auth-tab">Sign Up</button>
+        </div>
+
+        <div id="auth-login-panel" class="auth-panel">
+          <label class="field-label">Username</label>
+          <input id="login-username" class="field-input" type="text" autocomplete="username" />
+          <label class="field-label">Password</label>
+          <input id="login-password" class="field-input" type="password" autocomplete="current-password" />
+          <div id="auth-login-error" class="auth-error"></div>
+          <button id="btn-login" class="btn btn-primary auth-submit">Log In</button>
+        </div>
+
+        <div id="auth-signup-panel" class="auth-panel hidden">
+          <label class="field-label">Username</label>
+          <input id="signup-username" class="field-input" type="text" autocomplete="off" />
+          <label class="field-label">Password</label>
+          <input id="signup-password" class="field-input" type="password" autocomplete="new-password" />
+          <div class="field-hint">At least 6 characters.</div>
+          <div id="auth-signup-error" class="auth-error"></div>
+          <button id="btn-signup" class="btn btn-primary auth-submit">Create Account</button>
+        </div>
+
+        <div class="auth-footer">
+          <span class="auth-footnote">All calls & messages stay in Talky.</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="main-screen" class="main-shell hidden">
       <div class="main-inner">
-        <!-- Header -->
         <header class="main-header">
           <div class="header-left">
             <div class="dot"></div>
@@ -21,12 +56,13 @@
           </div>
           <div class="header-right">
             <div class="user-pill">
-              Demo user: <span id="header-username">guest</span>
+              <span id="header-username">User</span>
+              <span class="user-id-label" id="header-userid">ID: …</span>
             </div>
+            <button id="btn-logout" class="btn-pill">Sign out</button>
           </div>
         </header>
 
-        <!-- Call section -->
         <section class="call-section">
           <div class="call-panel">
             <div class="call-buttons-row">
@@ -40,40 +76,35 @@
               </button>
             </div>
             <div class="call-caption">
-              <strong>Click a call button</strong> to preview how a call layout would look.
-              (This demo doesn’t actually connect calls or use WebRTC yet.)
+              Start a video or audio call using <strong>Talky IDs</strong> – no phone numbers needed.
             </div>
           </div>
         </section>
 
-        <!-- Messages section -->
         <section class="messages-section">
           <div class="chat-header">
             <div class="chat-header-left">
               <div class="chat-header-title">Messages</div>
               <div class="chat-header-sub">
-                Talks are stored in a JSON file in your GitHub repo.
+                Chats for this account stay tied to your Talky ID.
               </div>
             </div>
             <div class="chat-actions">
               <button class="btn-pill" id="btn-new-chat">
                 <span class="dot-small"></span>
-                <span>New chat (demo)</span>
+                <span>New chat</span>
               </button>
-              <span class="badge-demo">GitHub-backed</span>
             </div>
           </div>
 
           <div class="messages-body">
-            <!-- chat list -->
             <div class="chat-list">
               <div class="chat-search">
-                <input type="search" id="chat-search-input" placeholder="Search people & messages" />
+                <input type="search" id="chat-search-input" placeholder="Search chats" />
               </div>
               <div class="chat-items" id="chat-items"></div>
             </div>
 
-            <!-- chat detail -->
             <div class="chat-detail">
               <div class="chat-detail-header">
                 <div>
@@ -82,11 +113,13 @@
                     No conversation selected.
                   </div>
                 </div>
-                <span class="badge-demo">Stored in GitHub</span>
+                <span class="badge-demo" id="chat-call-target">
+                  Talky ID will show here
+                </span>
               </div>
               <div class="chat-messages" id="chat-messages"></div>
               <div class="chat-input-row">
-                <input type="text" id="chat-input" placeholder="Message (saved to GitHub JSON)..." />
+                <input type="text" id="chat-input" placeholder="Message..." />
                 <button class="btn btn-primary" id="btn-chat-send">Send</button>
               </div>
             </div>
@@ -94,7 +127,6 @@
         </section>
       </div>
 
-      <!-- Call overlay -->
       <div id="call-overlay" class="call-overlay hidden">
         <div class="call-dialog">
           <div class="call-dialog-header">
@@ -103,6 +135,19 @@
           </div>
           <div class="call-dialog-body" id="call-dialog-body"></div>
         </div>
+      </div>
+    </div>
+
+    <div id="admin-overlay" class="admin-overlay hidden">
+      <div class="admin-dialog">
+        <div class="admin-header">
+          <div>
+            <div class="admin-title">Talky Admin</div>
+            <div class="admin-subtitle">Manage users and sessions</div>
+          </div>
+          <button id="admin-close" class="admin-close">✕</button>
+        </div>
+        <div id="admin-body" class="admin-body"></div>
       </div>
     </div>
   </div>

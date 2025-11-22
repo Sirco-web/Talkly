@@ -1,14 +1,14 @@
 {
-  "name": "talky-node-demo",
+  "name": "talky-github-demo",
   "version": "1.0.0",
-  "description": "Talky demo Node.js server with GitHub-backed JSON storage",
-  "type": "module",
+  "description": "Talky Node.js app with GitHub-backed JSON storage",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "express-session": "^1.17.3"
   },
   "engines": {
     "node": ">=18.0.0"

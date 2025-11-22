@@ -34,7 +34,7 @@ if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
   console.error("Missing GitHub env vars. Set GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO.");
 }
 
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "talky-session-secret",

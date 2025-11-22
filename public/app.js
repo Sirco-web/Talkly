@@ -299,6 +299,45 @@ async function decryptMessageForChat(chat, message) {
   }
 }
 
+// ---------- Remember-username state ----------
+const REMEMBER_KEY = "talky_remember_username";
+let rememberUsername = true; // default on
+
+function loadRememberedUsername() {
+  try {
+    const stored = localStorage.getItem(REMEMBER_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (parsed && typeof parsed.username === "string") {
+        loginUsernameInput.value = parsed.username;
+      }
+      if (typeof parsed.remember === "boolean") {
+        rememberUsername = parsed.remember;
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function saveRememberedUsername(username) {
+  try {
+    if (!rememberUsername) {
+      localStorage.removeItem(REMEMBER_KEY);
+      return;
+    }
+    localStorage.setItem(
+      REMEMBER_KEY,
+      JSON.stringify({ username, remember: true })
+    );
+  } catch {
+    // ignore
+  }
+}
+
+// Call once early
+loadRememberedUsername();
+
 // ---------- Auth flow ----------
 async function refreshMe() {
   try {
@@ -357,6 +396,8 @@ btnSignup.addEventListener("click", async () => {
     currentUser = res.user;
     headerUsername.textContent = currentUser.username;
     headerUserId.textContent = `ID: ${currentUser.id}`;
+    // remember the username for next time
+    saveRememberedUsername(username);
     signupUsernameInput.value = "";
     signupPasswordInput.value = "";
     loadChatKeyCache();
@@ -388,6 +429,8 @@ btnLogin.addEventListener("click", async () => {
     currentUser = res.user;
     headerUsername.textContent = currentUser.username;
     headerUserId.textContent = `ID: ${currentUser.id}`;
+    // save username so next time you only type password
+    saveRememberedUsername(username);
     loginPasswordInput.value = "";
     loadChatKeyCache();
     startPendingCallPolling();
@@ -616,15 +659,21 @@ async function startWebRTC(isCaller, callId, type) {
     if (event.candidate) sendSignal(callId, "candidate", event.candidate);
   };
 
+  // As soon as we get remote stream, attach to #remote-video (full-screen)
   peerConnection.ontrack = (event) => {
     const remoteVid = document.getElementById("remote-video");
-    if (remoteVid) remoteVid.srcObject = event.streams[0];
+    if (remoteVid) {
+      if (!remoteVid.srcObject) {
+        remoteVid.srcObject = event.streams[0];
+      }
+    }
   };
 
   try {
     const constraints = { audio: true, video: type === "video" };
     localStream = await navigator.mediaDevices.getUserMedia(constraints);
-    
+
+    // attach local stream to corner video
     const localVid = document.getElementById("local-video");
     if (localVid) {
       localVid.srcObject = localStream;
@@ -953,17 +1002,17 @@ function openChatSettingsModal(chat) {
   document.body.appendChild(overlay);
 }
 
-// Modify renderChatDetail to use the new single "Manage" button
+// Ensure renderChatDetail uses only the single Manage button and does not leave duplicates
 async function renderChatDetail(chat) {
-  // Cleanup previous header-manage/delete button if present
+  // Clean up any old manage/delete UI
   const existingManage = document.getElementById("btn-chat-manage");
-  if (existingManage) existingManage.remove();
-  
-  // Remove old rows if they exist
+  if (existingManage && existingManage.parentElement) {
+    existingManage.parentElement.removeChild(existingManage);
+  }
   const oldRow = document.getElementById("chat-manage-row");
-  if (oldRow) oldRow.remove();
+  if (oldRow && oldRow.parentElement) oldRow.parentElement.removeChild(oldRow);
   const oldDel = document.getElementById("btn-chat-delete");
-  if (oldDel) oldDel.remove();
+  if (oldDel && oldDel.parentElement) oldDel.parentElement.removeChild(oldDel);
 
   if (!chat) {
     chatDetailName.textContent = "Select a chat";
@@ -980,14 +1029,26 @@ async function renderChatDetail(chat) {
 
   chatDetailName.textContent = chat.name;
 
-  // Add "Manage" button to header
-  const manageBtn = document.createElement("button");
-  manageBtn.id = "btn-chat-manage";
-  manageBtn.className = "btn-pill";
-  manageBtn.textContent = "Manage";
-  manageBtn.style.marginLeft = "auto";
-  manageBtn.addEventListener("click", () => openChatSettingsModal(chat));
-  chatDetailName.parentElement.appendChild(manageBtn);
+  // Add a single "Manage" button on the right side of the header
+  const headerEl = chatDetailName.parentElement;
+  if (headerEl) {
+    let manageBtn = document.getElementById("btn-chat-manage");
+    if (!manageBtn) {
+      manageBtn = document.createElement("button");
+      manageBtn.id = "btn-chat-manage";
+      manageBtn.className = "btn-pill";
+      manageBtn.textContent = "Manage";
+      manageBtn.style.marginLeft = "auto";
+      manageBtn.addEventListener("click", () => openChatSettingsModal(chat));
+      headerEl.appendChild(manageBtn);
+    } else if (manageBtn.parentElement !== headerEl) {
+      manageBtn.parentElement.removeChild(manageBtn);
+      headerEl.appendChild(manageBtn);
+    } else {
+      // ensure it refers to the current chat
+      manageBtn.onclick = () => openChatSettingsModal(chat);
+    }
+  }
 
   const others = (chat.participantIds || []).filter(
     (id) => currentUser && id !== currentUser.id
@@ -1003,13 +1064,12 @@ async function renderChatDetail(chat) {
 
   chatCallTarget.textContent = `Your Talky ID: ${currentUser ? currentUser.id : "?"}`;
 
-  // Show key status text (no inline button, use Manage menu)
   const hasKey = !!(chatKeyCache[chat.id] && chatKeyCache[chat.id].code);
   if (!hasKey) {
     chatDetailPresence.textContent += " • 🔒 Locked (no key)";
   }
 
-  renderMessages(chat);
+  await renderMessages(chat);
 }
 
 // ---------- Calls (signaling only) ----------
@@ -1051,7 +1111,7 @@ function buildCallScreen(name, type, statusText, extraButtons = []) {
     localVideo.playsInline = true;
     localVideo.muted = true;
 
-    // Draggable logic for local video
+    // Make local video draggable over the remote video, Google Meet style
     let isDragging = false;
     let startX, startY, initialLeft, initialTop;
 
@@ -1080,10 +1140,12 @@ function buildCallScreen(name, type, statusText, extraButtons = []) {
 
     document.addEventListener('mouseup', () => {
       isDragging = false;
-      if(localVideo) localVideo.style.cursor = 'grab';
+      if (localVideo) localVideo.style.cursor = 'grab';
     });
 
-    // Overlay controls
+    vidContainer.appendChild(remoteVideo);
+    vidContainer.appendChild(localVideo);
+
     const controls = document.createElement("div");
     controls.className = "call-overlay-controls";
     
@@ -1097,28 +1159,28 @@ function buildCallScreen(name, type, statusText, extraButtons = []) {
       closeCallOverlay();
     });
     controls.appendChild(hangupBtn);
-    vidContainer.appendChild(controls);
 
+    // allow extra buttons if needed in future
+    extraButtons.forEach((b) => controls.appendChild(b));
+
+    vidContainer.appendChild(controls);
     screen.appendChild(vidContainer);
   } else {
+    // ...existing audio-call UI...
     const avatar = document.createElement("div");
     avatar.className = "call-avatar";
     avatar.textContent = name.slice(0, 2).toUpperCase();
     screen.appendChild(avatar);
-
     const nameEl = document.createElement("div");
     nameEl.className = "call-name";
     nameEl.textContent = name;
     screen.appendChild(nameEl);
-
     const statusEl = document.createElement("div");
     statusEl.className = "call-status";
     statusEl.textContent = statusText;
     screen.appendChild(statusEl);
-
     const buttonsRow = document.createElement("div");
     buttonsRow.className = "call-buttons";
-
     const endBtn = document.createElement("button");
     endBtn.className = "call-end-btn";
     endBtn.textContent = "✕";
@@ -1127,7 +1189,6 @@ function buildCallScreen(name, type, statusText, extraButtons = []) {
       stopWebRTC();
       closeCallOverlay();
     });
-
     buttonsRow.appendChild(endBtn);
     extraButtons.forEach((b) => buttonsRow.appendChild(b));
     screen.appendChild(buttonsRow);
@@ -1457,7 +1518,7 @@ refreshMe();
   } catch {}
 })();
 
-// ---------- Missing Polling Functions (Fixes "startPendingCallPolling is not defined") ----------
+// ---------- Polling helpers ----------
 function startPendingCallPolling() {
   if (pendingCallPollTimer) clearInterval(pendingCallPollTimer);
   pollPendingCalls(); // run immediately
@@ -1469,52 +1530,58 @@ function stopPendingCallPolling() {
   pendingCallPollTimer = null;
 }
 
-// ---------- Event Wiring & Logic ----------
+// ---------- Init & DOM wiring ----------
 
 function initApp() {
-  // Re-query elements to be safe
-  const btnNewChatRef = document.getElementById("btn-new-chat");
-  const btnChatSendRef = document.getElementById("btn-chat-send");
-  const chatInputRef = document.getElementById("chat-input");
-  const videoCallBtnRef = document.getElementById("btn-video-call");
-  const audioCallBtnRef = document.getElementById("btn-audio-call");
-
-  if (btnNewChatRef) {
-    btnNewChatRef.removeEventListener("click", openNewChatModal); // prevent duplicates
-    btnNewChatRef.addEventListener("click", (e) => {
+  // Wire New Chat
+  const btnNewChatElm = document.getElementById("btn-new-chat");
+  if (btnNewChatElm) {
+    btnNewChatElm.onclick = (e) => {
       e.preventDefault();
       openNewChatModal();
-    });
-  } else {
-    console.warn("New Chat button not found in DOM");
+    };
   }
 
-  if (btnChatSendRef) {
-    btnChatSendRef.addEventListener("click", sendMessage);
+  // Wire send button + enter key
+  if (btnChatSend) {
+    btnChatSend.onclick = sendMessage;
   }
-
-  if (chatInputRef) {
-    chatInputRef.addEventListener("keydown", (e) => {
+  if (chatInput) {
+    chatInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") sendMessage();
     });
   }
 
-  if (videoCallBtnRef) {
-    videoCallBtnRef.addEventListener("click", () => openCallStartDialog("video"));
+  // Wire settings button (gear icon)
+  const settingsBtn = document.getElementById("btn-settings");
+  if (settingsBtn) {
+    settingsBtn.onclick = (e) => {
+      e.preventDefault();
+      openSettingsModal();
+    };
   }
 
-  if (audioCallBtnRef) {
-    audioCallBtnRef.addEventListener("click", () => openCallStartDialog("audio"));
+  // Wire call buttons
+  if (videoCallBtn) {
+    videoCallBtn.onclick = () => openCallStartDialog("video");
+  }
+  if (audioCallBtn) {
+    audioCallBtn.onclick = () => openCallStartDialog("audio");
   }
 }
 
-// Run init when DOM is ready
+// Run init after DOM is ready
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", initApp);
 } else {
   initApp();
 }
 
+// Keep existing bottom‑of‑file init:
+switchAuthTab("login");
+refreshMe();
+
+// ---------- Message sending (kept at bottom for logical flow) ----------
 async function sendMessage() {
   const text = chatInput.value.trim();
   if (!text || !activeChatId) return;

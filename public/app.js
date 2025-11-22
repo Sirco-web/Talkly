@@ -562,7 +562,7 @@ async function renderMessages(chat) {
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-// ---------- Settings State ----------
+// ---------- Settings (ringtone, volume) ----------
 const SETTINGS_KEY = "talky_settings";
 let talkySettings = { ringtone: "default", volume: 0.6 };
 try {
@@ -722,15 +722,17 @@ function showNotification(title, body, onClick) {
   } catch {}
 }
 
-// Settings modal (open when clicking header username)
+// Settings modal (open when clicking header username or settings button)
 headerUsername.style.cursor = "pointer";
 headerUsername.addEventListener("click", openSettingsModal);
 
+const btnSettings = document.getElementById("btn-settings");
+if (btnSettings) {
+  btnSettings.addEventListener("click", openSettingsModal);
+}
+
 function openSettingsModal() {
-  const overlay = document.createElement("div");
-  overlay.className = "modal-overlay";
-  const dialog = document.createElement("div");
-  dialog.className = "modal-dialog";
+  const { overlay, dialog } = createModalOverlay();
 
   const header = document.createElement("div");
   header.className = "modal-header";
@@ -744,6 +746,10 @@ function openSettingsModal() {
   header.appendChild(title);
   header.appendChild(closeBtn);
 
+  const body = document.createElement("div");
+  body.style.padding = "10px 0";
+
+  // Ringtone Row
   const rowR = document.createElement("div");
   rowR.className = "modal-row";
   const lblR = document.createElement("div");
@@ -756,6 +762,7 @@ function openSettingsModal() {
   rowR.appendChild(lblR);
   rowR.appendChild(sel);
 
+  // Volume Row
   const rowV = document.createElement("div");
   rowV.className = "modal-row";
   const lblV = document.createElement("div");
@@ -765,23 +772,27 @@ function openSettingsModal() {
   rowV.appendChild(lblV);
   rowV.appendChild(vol);
 
+  body.appendChild(rowR);
+  body.appendChild(rowV);
+
+  // Test Button
   const testBtn = document.createElement("button");
-  testBtn.className = "btn-pill";
-  testBtn.textContent = "Test ringtone";
+  testBtn.className = "modal-menu-btn";
+  testBtn.textContent = "🔊 Test Ringtone";
   testBtn.addEventListener("click", () => {
     talkySettings.ringtone = sel.value;
     talkySettings.volume = Number(vol.value);
     saveSettings();
-    // quick test tone
     playRingtone();
     setTimeout(stopTone, 800);
   });
+  body.appendChild(testBtn);
 
   const actions = document.createElement("div");
   actions.className = "modal-actions";
   const done = document.createElement("button");
   done.className = "btn btn-primary";
-  done.textContent = "Save";
+  done.textContent = "Save & Close";
   done.addEventListener("click", async () => {
     talkySettings.ringtone = sel.value;
     talkySettings.volume = Number(vol.value);
@@ -789,14 +800,11 @@ function openSettingsModal() {
     await ensureNotifications();
     document.body.removeChild(overlay);
   });
-  actions.appendChild(testBtn);
   actions.appendChild(done);
 
   dialog.appendChild(header);
-  dialog.appendChild(rowR);
-  dialog.appendChild(rowV);
+  dialog.appendChild(body);
   dialog.appendChild(actions);
-  overlay.appendChild(dialog);
   document.body.appendChild(overlay);
 }
 
@@ -810,7 +818,7 @@ function openChatSettingsModal(chat) {
   header.className = "modal-header";
   const title = document.createElement("div");
   title.className = "modal-title";
-  title.textContent = "Chat Settings: " + chat.name;
+  title.textContent = "Manage Chat";
   const closeBtn = document.createElement("button");
   closeBtn.className = "call-end-btn";
   closeBtn.textContent = "✕";
@@ -821,14 +829,13 @@ function openChatSettingsModal(chat) {
   const body = document.createElement("div");
   body.style.display = "flex";
   body.style.flexDirection = "column";
-  body.style.gap = "10px";
-  body.style.padding = "10px 0";
+  body.style.gap = "8px";
+  body.style.padding = "16px 0";
 
   // 1. Rename
   const btnRename = document.createElement("button");
-  btnRename.className = "btn-pill";
-  btnRename.textContent = "Rename Chat";
-  btnRename.style.textAlign = "left";
+  btnRename.className = "modal-menu-btn";
+  btnRename.textContent = "✏️ Rename Chat";
   btnRename.addEventListener("click", async () => {
     document.body.removeChild(overlay);
     const newName = await showPrompt("Rename chat", "New chat name:", { placeholder: chat.name });
@@ -851,10 +858,9 @@ function openChatSettingsModal(chat) {
 
   // 2. Import/View Key
   const btnKey = document.createElement("button");
-  btnKey.className = "btn-pill";
+  btnKey.className = "modal-menu-btn";
   const hasKey = !!(chatKeyCache[chat.id] && chatKeyCache[chat.id].code);
-  btnKey.textContent = hasKey ? "View Chat Key" : "Import Chat Key (Locked)";
-  btnKey.style.textAlign = "left";
+  btnKey.textContent = hasKey ? "🔑 View Chat Key" : "📥 Import Chat Key";
   btnKey.addEventListener("click", async () => {
     document.body.removeChild(overlay);
     if (hasKey) {
@@ -866,9 +872,8 @@ function openChatSettingsModal(chat) {
 
   // 3. Clear Messages
   const btnClear = document.createElement("button");
-  btnClear.className = "btn-pill";
-  btnClear.textContent = "Clear History";
-  btnClear.style.textAlign = "left";
+  btnClear.className = "modal-menu-btn";
+  btnClear.textContent = "🧹 Clear History";
   btnClear.addEventListener("click", async () => {
     document.body.removeChild(overlay);
     const ok = await showConfirm("Clear messages", "Clear all messages in this chat? This cannot be undone.");
@@ -886,9 +891,8 @@ function openChatSettingsModal(chat) {
 
   // 4. Rotate Key
   const btnRotate = document.createElement("button");
-  btnRotate.className = "btn-pill";
-  btnRotate.textContent = "Rotate Key (Re-create Chat)";
-  btnRotate.style.textAlign = "left";
+  btnRotate.className = "modal-menu-btn";
+  btnRotate.textContent = "🔄 Rotate Key (Re-create Chat)";
   btnRotate.addEventListener("click", async () => {
     document.body.removeChild(overlay);
     const ok = await showConfirm("Rotate key", "Rotate this chat key: a new chat will be created and the old chat deleted. Continue?");
@@ -919,11 +923,8 @@ function openChatSettingsModal(chat) {
 
   // 5. Delete Chat
   const btnDelete = document.createElement("button");
-  btnDelete.className = "btn-pill";
-  btnDelete.textContent = "Delete Chat";
-  btnDelete.style.background = "#ffecec";
-  btnDelete.style.color = "#d00";
-  btnDelete.style.textAlign = "left";
+  btnDelete.className = "modal-menu-btn danger";
+  btnDelete.textContent = "🗑️ Delete Chat";
   btnDelete.addEventListener("click", async () => {
     document.body.removeChild(overlay);
     const ok = await showConfirm("Delete chat", "Delete this chat and all messages? This cannot be undone.");
@@ -945,7 +946,6 @@ function openChatSettingsModal(chat) {
   body.appendChild(btnKey);
   body.appendChild(btnClear);
   body.appendChild(btnRotate);
-  body.appendChild(document.createElement("hr"));
   body.appendChild(btnDelete);
 
   dialog.appendChild(header);
@@ -1471,26 +1471,48 @@ function stopPendingCallPolling() {
 
 // ---------- Event Wiring & Logic ----------
 
-if (btnNewChat) {
-  btnNewChat.addEventListener("click", openNewChatModal);
+function initApp() {
+  // Re-query elements to be safe
+  const btnNewChatRef = document.getElementById("btn-new-chat");
+  const btnChatSendRef = document.getElementById("btn-chat-send");
+  const chatInputRef = document.getElementById("chat-input");
+  const videoCallBtnRef = document.getElementById("btn-video-call");
+  const audioCallBtnRef = document.getElementById("btn-audio-call");
+
+  if (btnNewChatRef) {
+    btnNewChatRef.removeEventListener("click", openNewChatModal); // prevent duplicates
+    btnNewChatRef.addEventListener("click", (e) => {
+      e.preventDefault();
+      openNewChatModal();
+    });
+  } else {
+    console.warn("New Chat button not found in DOM");
+  }
+
+  if (btnChatSendRef) {
+    btnChatSendRef.addEventListener("click", sendMessage);
+  }
+
+  if (chatInputRef) {
+    chatInputRef.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendMessage();
+    });
+  }
+
+  if (videoCallBtnRef) {
+    videoCallBtnRef.addEventListener("click", () => openCallStartDialog("video"));
+  }
+
+  if (audioCallBtnRef) {
+    audioCallBtnRef.addEventListener("click", () => openCallStartDialog("audio"));
+  }
 }
 
-if (btnChatSend) {
-  btnChatSend.addEventListener("click", sendMessage);
-}
-
-if (chatInput) {
-  chatInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") sendMessage();
-  });
-}
-
-if (videoCallBtn) {
-  videoCallBtn.addEventListener("click", () => openCallStartDialog("video"));
-}
-
-if (audioCallBtn) {
-  audioCallBtn.addEventListener("click", () => openCallStartDialog("audio"));
+// Run init when DOM is ready
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initApp);
+} else {
+  initApp();
 }
 
 async function sendMessage() {
@@ -1519,6 +1541,7 @@ async function sendMessage() {
 }
 
 async function openNewChatModal() {
+  console.log("Opening new chat modal...");
   const { overlay, dialog } = createModalOverlay();
   
   const header = document.createElement("div");
@@ -1534,6 +1557,7 @@ async function openNewChatModal() {
   header.appendChild(closeBtn);
 
   const body = document.createElement("div");
+  body.style.padding = "10px 0";
   
   // Name input
   const row1 = document.createElement("div");
@@ -1600,4 +1624,7 @@ async function openNewChatModal() {
   dialog.appendChild(body);
   dialog.appendChild(actions);
   document.body.appendChild(overlay);
+  
+  // Focus input
+  setTimeout(() => inpName.focus(), 50);
 }

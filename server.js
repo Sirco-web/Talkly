@@ -472,7 +472,12 @@ app.post("/api/calls/:id/decline", requireAuth, async (req, res) => {
   const callId = req.params.id;
   const db = await loadDB();
   const call = db.calls.find((c) => c.id === callId);
-  if (!call) return res.status(404).json({ error: "Call not found" });
+  
+  // Idempotency: If call not found, assume already ended/deleted and just clean up signals
+  if (!call) {
+    delete signalStore[callId];
+    return res.json({ status: "ended" });
+  }
 
   // Allow caller or callee to end/decline
   if (call.fromUserId !== req.session.userId && call.toUserId !== req.session.userId) {

@@ -145,7 +145,14 @@ function CallOverlay({ call, onClose, isIncoming }) {
   // WebRTC Setup
   const startWebRTC = useCallback(async (isCaller) => {
     console.log("Starting WebRTC, isCaller:", isCaller);
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    const pc = new RTCPeerConnection({ 
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:global.stun.twilio.com:3478" }
+      ] 
+    });
     peerRef.current = pc;
 
     pc.onicecandidate = (e) => {
@@ -171,11 +178,11 @@ function CallOverlay({ call, onClose, isIncoming }) {
       }
     } catch (e) {
       console.error("Media Error:", e);
-      alert("Could not access camera/microphone. Ensure you are on HTTPS or localhost.");
+      alert(`Camera/Mic Error: ${e.name} - ${e.message}. Check browser permissions.`);
     }
   }, [call]);
 
-  // Polling for signals (SDP/ICE)
+  // Polling for signals (SDP/ICE) - Faster polling (500ms)
   useEffect(() => {
     if (!connected) return;
     let lastTs = Date.now();
@@ -200,7 +207,7 @@ function CallOverlay({ call, onClose, isIncoming }) {
           }
         }
       } catch {}
-    }, 1000);
+    }, 500);
     return () => clearInterval(interval);
   }, [connected, call.id]);
 
@@ -222,23 +229,18 @@ function CallOverlay({ call, onClose, isIncoming }) {
     } else {
       // OUTGOING CALL: Start camera immediately (Google Meet style)
       if (call.type === 'video') {
-        startWebRTC(true); // Initialize local stream & PC, but don't send offer until connected? 
-        // Actually, we can't send offer until callee is ready to receive signals.
-        // But we CAN show local video.
-        // Let's modify startWebRTC to handle "early media" vs "signaling".
-        // For simplicity in this refactor: We call startWebRTC(true) ONLY when connected, 
-        // BUT we manually get user media here for preview.
-        
-        navigator.mediaDevices.getUserMedia({ audio: true, video: true })
-          .then(stream => {
-             if (localVideoRef.current) {
-               localVideoRef.current.srcObject = stream;
-               localVideoRef.current.muted = true;
-             }
-             // Store stream to hand off to WebRTC later? 
-             // Or just let startWebRTC re-acquire (browser usually handles this fine).
-          })
-          .catch(e => console.error("Preview failed", e));
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+            .then(stream => {
+               if (localVideoRef.current) {
+                 localVideoRef.current.srcObject = stream;
+                 localVideoRef.current.muted = true;
+               }
+            })
+            .catch(e => console.error("Preview failed", e));
+        } else {
+          alert("WebRTC not supported in this browser context (is this HTTPS?)");
+        }
       }
 
       playTone(425, 'sine'); // Dial tone
@@ -252,7 +254,6 @@ function CallOverlay({ call, onClose, isIncoming }) {
             stopTone();
             setStatus("Connected");
             setConnected(true);
-            // If we haven't started WebRTC yet (we did preview only), start it now properly
             startWebRTC(true); 
           } else if (res.call.status === 'ended') {
             clearInterval(pollRef.current);
@@ -267,30 +268,41 @@ function CallOverlay({ call, onClose, isIncoming }) {
       stopTone();
       if (pollRef.current) clearInterval(pollRef.current);
       if (peerRef.current) peerRef.current.close();
+      // Ensure tracks are stopped on unmount
+      if (localVideoRef.current && localVideoRef.current.srcObject) {
+        localVideoRef.current.srcObject.getTracks().forEach(t => t.stop());
+      }
     };
   }, []);
 
   const handleAccept = async () => {
     stopTone();
-    await jsonFetch(`/api/calls/${call.id}/accept`, { method: 'POST' });
-    setStatus("Connected");
-    setConnected(true);
-    startWebRTC(false);
+    try {
+      await jsonFetch(`/api/calls/${call.id}/accept`, { method: 'POST' });
+      setStatus("Connected");
+      setConnected(true);
+      startWebRTC(false);
+    } catch (e) {
+      alert("Failed to accept call: " + e.message);
+      onClose();
+    }
   };
 
   const handleHangup = async () => {
     stopTone();
-    if (isIncoming && !connected) {
+    try {
+      // Attempt to notify server, but don't block UI closing on failure
       await jsonFetch(`/api/calls/${call.id}/decline`, { method: 'POST' });
-    } else {
-      // End call for everyone
-      await jsonFetch(`/api/calls/${call.id}/decline`, { method: 'POST' });
+    } catch (e) {
+      console.error("Hangup API failed (ignoring):", e);
+    } finally {
+      // Always clean up local state
+      if (localVideoRef.current && localVideoRef.current.srcObject) {
+        localVideoRef.current.srcObject.getTracks().forEach(t => t.stop());
+      }
+      if (peerRef.current) peerRef.current.close();
+      onClose();
     }
-    // Clean up local stream
-    if (localVideoRef.current && localVideoRef.current.srcObject) {
-      localVideoRef.current.srcObject.getTracks().forEach(t => t.stop());
-    }
-    onClose();
   };
 
   // Draggable Video Logic

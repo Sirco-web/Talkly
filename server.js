@@ -1,4 +1,4 @@
-// server.js - Talky with GitHub-backed storage + encrypted chats + basic calls
+// server.js - Talky with GitHub-backed storage + encrypted chats (Calls Removed)
 const express = require("express");
 const path = require("path");
 const crypto = require("crypto");
@@ -19,9 +19,6 @@ if (!fetch) {
 
 const app = express();
 
-// In-memory store for WebRTC signals to avoid GitHub rate limits/latency
-const signalStore = {};
-
 const PORT = process.env.PORT || 3000;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER;
@@ -29,6 +26,22 @@ const GITHUB_REPO = process.env.GITHUB_REPO;
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 const DATA_PATH = process.env.DATA_PATH || "talky/data.json";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-me-admin-pass";
+
+// --- In-Memory Cache for Speed ---
+let dbCache = null;
+let dbCacheTime = 0;
+const CACHE_TTL = 5000; // 5 seconds TTL for external changes, otherwise we use local cache
+
+// Background save queue to prevent race conditions and allow instant response
+let saveQueue = Promise.resolve();
+function queueSaveDB(db) {
+  // Update cache immediately
+  dbCache = db;
+  dbCacheTime = Date.now();
+  
+  // Queue the GitHub write
+  saveQueue = saveQueue.then(() => saveDBInternal(db)).catch(err => console.error("Background save failed:", err));
+}
 
 if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
   console.error("Missing GitHub env vars. Set GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO.");
@@ -102,7 +115,13 @@ async function githubRequest(path, options = {}) {
 
 async function loadDB() {
   if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
-    return { users: [], chats: [], messages: [], calls: [], globalPaused: { messages: false, calls: false } };
+    return { users: [], chats: [], messages: [], globalPaused: { messages: false } };
+  }
+
+  // Serve from cache if available and fresh enough (or if we just wrote to it)
+  if (dbCache && (Date.now() - dbCacheTime < CACHE_TTL)) {
+    // Return a deep copy to prevent mutation issues
+    return JSON.parse(JSON.stringify(dbCache));
   }
 
   try {
@@ -118,21 +137,26 @@ async function loadDB() {
     if (!Array.isArray(json.users)) json.users = [];
     if (!Array.isArray(json.chats)) json.chats = [];
     if (!Array.isArray(json.messages)) json.messages = [];
-    if (!Array.isArray(json.calls)) json.calls = [];
     if (!json.globalPaused || typeof json.globalPaused !== "object")
-      json.globalPaused = { messages: false, calls: false };
+      json.globalPaused = { messages: false };
+
+    // Update cache
+    dbCache = json;
+    dbCacheTime = Date.now();
 
     return json;
   } catch (err) {
     if (String(err.message).includes("404")) {
-      return { users: [], chats: [], messages: [], calls: [], globalPaused: { messages: false, calls: false } };
+      return { users: [], chats: [], messages: [], globalPaused: { messages: false } };
     }
     console.error("Failed to load DB from GitHub:", err);
-    return { users: [], chats: [], messages: [], calls: [], globalPaused: { messages: false, calls: false } };
+    // Return cache if available even if expired, better than crashing
+    if (dbCache) return JSON.parse(JSON.stringify(dbCache));
+    return { users: [], chats: [], messages: [], globalPaused: { messages: false } };
   }
 }
 
-async function saveDB(db) {
+async function saveDBInternal(db) {
   if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) return false;
   const sha = db._sha;
   const payload = { ...db };
@@ -162,13 +186,18 @@ async function saveDB(db) {
 
     if (res && res.content && res.content.sha) {
       db._sha = res.content.sha;
+      if (dbCache) dbCache._sha = res.content.sha;
     }
     return true;
   } catch (err) {
     console.error("Failed to save DB to GitHub:", err);
-    // Don't throw to avoid turning API calls into 5xx when GitHub is unavailable.
     return false;
   }
+}
+
+async function saveDB(db) {
+  queueSaveDB(db);
+  return true;
 }
 
 function requireAuth(req, res, next) {
@@ -310,8 +339,6 @@ app.post("/api/chats", requireAuth, async (req, res) => {
   const currentUserId = req.session.userId;
   participantIds.push(currentUserId);
 
-  // Resolve each participant entry: if it looks like an id (u_...) validate directly,
-  // otherwise treat as username and resolve to id.
   const missing = [];
   for (const p of participants) {
     if (typeof p !== "string") {
@@ -356,10 +383,56 @@ app.post("/api/chats", requireAuth, async (req, res) => {
   };
 
   db.chats.push(chat);
-  // attempt to save, but don't fail the request if GitHub is unavailable
   await saveDB(db);
 
   res.status(201).json({ chat });
+});
+
+// NEW: Upload File to GitHub (separate from data.json)
+app.post("/api/upload", requireAuth, async (req, res) => {
+  const { content, ext } = req.body; // content is base64 encrypted data
+  if (!content || !ext) return res.status(400).json({ error: "Missing content or extension" });
+
+  const userId = req.session.userId;
+  const randomName = crypto.randomBytes(16).toString("hex");
+  const fileName = `${randomName}${ext}`;
+  const filePath = `talky/uploads/${userId}/${fileName}`;
+
+  const body = {
+    message: `Upload ${fileName}`,
+    content: content, // GitHub API expects base64 content
+    branch: GITHUB_BRANCH
+  };
+
+  try {
+    await githubRequest(
+      `/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}`,
+      { method: "PUT", body: JSON.stringify(body) }
+    );
+    res.json({ path: filePath });
+  } catch (err) {
+    console.error("Upload failed:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// NEW: Get File from GitHub
+app.get("/api/file", requireAuth, async (req, res) => {
+  const filePath = req.query.path;
+  if (!filePath) return res.status(400).send("Missing path");
+
+  try {
+    const file = await githubRequest(
+      `/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(GITHUB_BRANCH)}`
+    );
+    // file.content is base64
+    const buffer = Buffer.from(file.content, "base64");
+    res.set("Content-Type", "application/octet-stream");
+    res.send(buffer);
+  } catch (err) {
+    console.error("File fetch failed:", err);
+    res.status(404).send("File not found");
+  }
 });
 
 // Messages endpoint: check global pause
@@ -391,107 +464,11 @@ app.post("/api/messages", requireAuth, async (req, res) => {
     ts: Date.now()
   };
   db.messages.push(msg);
-  await saveDB(db);
+  
+  // Use non-blocking save for instant response
+  queueSaveDB(db);
 
   res.status(201).json({ message: msg });
-});
-
-// Calls endpoint: check global pause
-app.post("/api/calls", requireAuth, async (req, res) => {
-  const { toUsername, type, chatId } = req.body || {};
-  if (!toUsername || !type) {
-    return res.status(400).json({ error: "toUsername and type are required." });
-  }
-  if (!["video", "audio"].includes(type)) {
-    return res.status(400).json({ error: "Invalid call type." });
-  }
-
-  const db = await loadDB();
-
-  if (db.globalPaused && db.globalPaused.calls && !req.session.isAdmin) {
-    return res.status(503).json({ error: "Calling is currently disabled by admin." });
-  }
-
-  const toUser = db.users.find(
-    (u) => u.username.toLowerCase() === String(toUsername).toLowerCase() || u.id === String(toUsername)
-  );
-  if (!toUser) {
-    return res.status(400).json({ error: "Target user not found." });
-  }
-
-  const call = {
-    id: generateId("call"),
-    type,
-    fromUserId: req.session.userId,
-    toUserId: toUser.id,
-    chatId: chatId || null,
-    status: "ringing",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  db.calls.push(call);
-  await saveDB(db);
-  res.status(201).json({ call });
-});
-
-// NEW: Get pending calls for the current user
-app.get("/api/calls/pending", requireAuth, async (req, res) => {
-  const db = await loadDB();
-  const userId = req.session.userId;
-  // Filter for calls to this user that are 'ringing' and created within last 60s
-  const now = Date.now();
-  const calls = db.calls.filter(
-    (c) =>
-      c.toUserId === userId &&
-      c.status === "ringing" &&
-      now - new Date(c.createdAt).getTime() < 60000
-  );
-  res.json({ calls });
-});
-
-// NEW: Accept a call
-app.post("/api/calls/:id/accept", requireAuth, async (req, res) => {
-  const callId = req.params.id;
-  const db = await loadDB();
-  const call = db.calls.find((c) => c.id === callId);
-  if (!call) return res.status(404).json({ error: "Call not found" });
-  
-  if (call.toUserId !== req.session.userId) {
-    return res.status(403).json({ error: "Not authorized to accept this call" });
-  }
-
-  call.status = "connected";
-  call.updatedAt = new Date().toISOString();
-  await saveDB(db);
-  res.json({ call });
-});
-
-// NEW: Decline/End a call
-app.post("/api/calls/:id/decline", requireAuth, async (req, res) => {
-  const callId = req.params.id;
-  const db = await loadDB();
-  const call = db.calls.find((c) => c.id === callId);
-  
-  // Idempotency: If call not found, assume already ended/deleted and just clean up signals
-  if (!call) {
-    delete signalStore[callId];
-    return res.json({ status: "ended" });
-  }
-
-  // Allow caller or callee to end/decline
-  if (call.fromUserId !== req.session.userId && call.toUserId !== req.session.userId) {
-    return res.status(403).json({ error: "Not authorized" });
-  }
-
-  call.status = "ended";
-  call.updatedAt = new Date().toISOString();
-  await saveDB(db);
-
-  // Cleanup signals
-  delete signalStore[callId];
-
-  res.json({ call });
 });
 
 // Chat management endpoints: rename, clear messages, delete, set-key in-place, rotate(create new & delete old)
@@ -595,51 +572,14 @@ app.post("/api/chats/:id/rotate", requireAuth, async (req, res) => {
   res.json({ chat: newChat });
 });
 
-// Admin: pause/unpause messaging or calls or both
+// Admin: pause/unpause messaging
 app.post("/api/admin/pause", requireAdmin, async (req, res) => {
-  const { pauseMessages, pauseCalls } = req.body || {};
+  const { pauseMessages } = req.body || {};
   const db = await loadDB();
-  db.globalPaused = db.globalPaused || { messages: false, calls: false };
+  db.globalPaused = db.globalPaused || { messages: false };
   if (typeof pauseMessages === "boolean") db.globalPaused.messages = pauseMessages;
-  if (typeof pauseCalls === "boolean") db.globalPaused.calls = pauseCalls;
   await saveDB(db);
   res.json({ globalPaused: db.globalPaused });
-});
-
-// Add signaling endpoint for WebRTC (In-memory only to avoid GitHub rate limits)
-app.post("/api/calls/:id/signal", requireAuth, (req, res) => {
-  const callId = req.params.id;
-  const { type, data } = req.body || {};
-  
-  // Use in-memory store instead of loading DB
-  if (!signalStore[callId]) signalStore[callId] = [];
-  
-  signalStore[callId].push({ 
-    type, 
-    data, 
-    fromUserId: req.session.userId, 
-    ts: Date.now() 
-  });
-  
-  res.json({ ok: true });
-});
-
-app.get("/api/calls/:id/signal", requireAuth, (req, res) => {
-  const callId = req.params.id;
-  const since = parseInt(req.query.since || "0");
-  
-  // Read from in-memory store
-  const signals = (signalStore[callId] || []).filter(s => s.ts > since && s.fromUserId !== req.session.userId);
-  res.json({ signals });
-});
-
-// Endpoint to check call status (for caller to know when accepted)
-app.get("/api/calls/:id", requireAuth, async (req, res) => {
-  const callId = req.params.id;
-  const db = await loadDB();
-  const call = db.calls.find((c) => c.id === callId);
-  if (!call) return res.status(404).json({ error: "Call not found" });
-  res.json({ call });
 });
 
 app.get("*", (req, res) => {

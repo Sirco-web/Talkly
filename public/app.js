@@ -38,28 +38,6 @@ function generateChatKeyCode() {
 }
 function bytesToHex(bytes) { return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join(""); }
 
-// --- Audio Context ---
-let audioCtx = null;
-let toneNode = null;
-let toneGain = null;
-function playTone(freq, type = "sine", vol = 0.5) {
-  if (toneNode) stopTone();
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-  toneNode = audioCtx.createOscillator();
-  toneGain = audioCtx.createGain();
-  toneNode.type = type;
-  toneNode.frequency.value = freq;
-  toneGain.gain.value = vol;
-  toneNode.connect(toneGain);
-  toneGain.connect(audioCtx.destination);
-  toneNode.start();
-}
-function stopTone() {
-  if (toneNode) { try { toneNode.stop(); } catch{} toneNode.disconnect(); toneNode = null; }
-  if (toneGain) { toneGain.disconnect(); toneGain = null; }
-}
-
 // --- Components ---
 
 function Modal({ title, onClose, children }) {
@@ -134,270 +112,15 @@ function AuthScreen({ onLogin }) {
   );
 }
 
-function CallOverlay({ call, onClose, isIncoming }) {
-  const [status, setStatus] = useState(isIncoming ? "Incoming Call..." : "Calling...");
-  const [connected, setConnected] = useState(false);
-  const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
-  const peerRef = useRef(null);
-  const pollRef = useRef(null);
-
-  // WebRTC Setup
-  const startWebRTC = useCallback(async (isCaller) => {
-    console.log("Starting WebRTC, isCaller:", isCaller);
-    const pc = new RTCPeerConnection({ 
-      iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:global.stun.twilio.com:3478" }
-      ] 
-    });
-    peerRef.current = pc;
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) jsonFetch(`/api/calls/${call.id}/signal`, { method: 'POST', body: JSON.stringify({ type: 'candidate', data: e.candidate }) });
-    };
-    pc.ontrack = (e) => {
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = e.streams[0];
-    };
-
-    try {
-      // Get media immediately
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.type === 'video' });
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-        localVideoRef.current.muted = true;
-      }
-      stream.getTracks().forEach(t => pc.addTrack(t, stream));
-
-      if (isCaller) {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        await jsonFetch(`/api/calls/${call.id}/signal`, { method: 'POST', body: JSON.stringify({ type: 'offer', data: offer }) });
-      }
-    } catch (e) {
-      console.error("Media Error:", e);
-      alert(`Camera/Mic Error: ${e.name} - ${e.message}. Check browser permissions.`);
-    }
-  }, [call]);
-
-  // Polling for signals (SDP/ICE) - Faster polling (500ms)
-  useEffect(() => {
-    if (!connected) return;
-    let lastTs = Date.now();
-    const interval = setInterval(async () => {
-      try {
-        const res = await jsonFetch(`/api/calls/${call.id}/signal?since=${lastTs}`);
-        if (res.signals) {
-          for (const sig of res.signals) {
-            lastTs = Math.max(lastTs, sig.ts);
-            const pc = peerRef.current;
-            if (!pc) continue;
-            if (sig.type === 'offer') {
-              await pc.setRemoteDescription(new RTCSessionDescription(sig.data));
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-              await jsonFetch(`/api/calls/${call.id}/signal`, { method: 'POST', body: JSON.stringify({ type: 'answer', data: answer }) });
-            } else if (sig.type === 'answer') {
-              await pc.setRemoteDescription(new RTCSessionDescription(sig.data));
-            } else if (sig.type === 'candidate') {
-              await pc.addIceCandidate(new RTCIceCandidate(sig.data));
-            }
-          }
-        }
-      } catch {}
-    }, 500);
-    return () => clearInterval(interval);
-  }, [connected, call.id]);
-
-  // Initial Call Logic
-  useEffect(() => {
-    if (isIncoming) {
-      playTone(880, 'triangle'); // Ringtone
-      // Poll for cancellation by caller
-      pollRef.current = setInterval(async () => {
-        try {
-          const res = await jsonFetch(`/api/calls/${call.id}`);
-          if (res.call.status === 'ended') {
-            clearInterval(pollRef.current);
-            stopTone();
-            onClose();
-          }
-        } catch {}
-      }, 1000);
-    } else {
-      // OUTGOING CALL: Start camera immediately (Google Meet style)
-      if (call.type === 'video') {
-        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-          navigator.mediaDevices.getUserMedia({ audio: true, video: true })
-            .then(stream => {
-               if (localVideoRef.current) {
-                 localVideoRef.current.srcObject = stream;
-                 localVideoRef.current.muted = true;
-               }
-            })
-            .catch(e => console.error("Preview failed", e));
-        } else {
-          alert("WebRTC not supported in this browser context (is this HTTPS?)");
-        }
-      }
-
-      playTone(425, 'sine'); // Dial tone
-      
-      // Poll for acceptance
-      pollRef.current = setInterval(async () => {
-        try {
-          const res = await jsonFetch(`/api/calls/${call.id}`);
-          if (res.call.status === 'connected') {
-            clearInterval(pollRef.current);
-            stopTone();
-            setStatus("Connected");
-            setConnected(true);
-            startWebRTC(true); 
-          } else if (res.call.status === 'ended') {
-            clearInterval(pollRef.current);
-            stopTone();
-            onClose();
-            alert("Call declined or ended.");
-          }
-        } catch {}
-      }, 1000);
-    }
-    return () => {
-      stopTone();
-      if (pollRef.current) clearInterval(pollRef.current);
-      if (peerRef.current) peerRef.current.close();
-      // Ensure tracks are stopped on unmount
-      if (localVideoRef.current && localVideoRef.current.srcObject) {
-        localVideoRef.current.srcObject.getTracks().forEach(t => t.stop());
-      }
-    };
-  }, []);
-
-  const handleAccept = async () => {
-    stopTone();
-    try {
-      await jsonFetch(`/api/calls/${call.id}/accept`, { method: 'POST' });
-      setStatus("Connected");
-      setConnected(true);
-      startWebRTC(false);
-    } catch (e) {
-      alert("Failed to accept call: " + e.message);
-      onClose();
-    }
-  };
-
-  const handleHangup = async () => {
-    stopTone();
-    try {
-      // Attempt to notify server, but don't block UI closing on failure
-      await jsonFetch(`/api/calls/${call.id}/decline`, { method: 'POST' });
-    } catch (e) {
-      console.error("Hangup API failed (ignoring):", e);
-    } finally {
-      // Always clean up local state
-      if (localVideoRef.current && localVideoRef.current.srcObject) {
-        localVideoRef.current.srcObject.getTracks().forEach(t => t.stop());
-      }
-      if (peerRef.current) peerRef.current.close();
-      onClose();
-    }
-  };
-
-  // Draggable Video Logic
-  const dragRef = useRef({ isDragging: false, startX: 0, startY: 0, initialLeft: 0, initialTop: 0 });
-  const handleMouseDown = (e) => {
-    const vid = localVideoRef.current;
-    if (!vid) return;
-    dragRef.current.isDragging = true;
-    dragRef.current.startX = e.clientX;
-    dragRef.current.startY = e.clientY;
-    const rect = vid.getBoundingClientRect();
-    const parent = vid.parentElement.getBoundingClientRect();
-    dragRef.current.initialLeft = rect.left - parent.left;
-    dragRef.current.initialTop = rect.top - parent.top;
-    vid.style.cursor = 'grabbing';
-    vid.style.bottom = 'auto'; vid.style.right = 'auto';
-    vid.style.left = dragRef.current.initialLeft + 'px';
-    vid.style.top = dragRef.current.initialTop + 'px';
-  };
-  const handleMouseMove = (e) => {
-    if (!dragRef.current.isDragging) return;
-    const dx = e.clientX - dragRef.current.startX;
-    const dy = e.clientY - dragRef.current.startY;
-    if (localVideoRef.current) {
-      localVideoRef.current.style.left = (dragRef.current.initialLeft + dx) + 'px';
-      localVideoRef.current.style.top = (dragRef.current.initialTop + dy) + 'px';
-    }
-  };
-  const handleMouseUp = () => {
-    dragRef.current.isDragging = false;
-    if (localVideoRef.current) localVideoRef.current.style.cursor = 'grab';
-  };
-
-  useEffect(() => {
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, []);
-
-  // Render logic:
-  // If video call: Always show video wrapper.
-  // If incoming & not connected: Show avatar/accept screen overlaying video? No, just standard screen.
-  // If outgoing: Show video wrapper immediately (local cam active), remote is black.
-  
-  const showVideoLayout = call.type === 'video' && (!isIncoming || connected);
-
-  return (
-    <div id="call-overlay">
-      <div className="call-dialog" style={showVideoLayout ? { width: '100%', maxWidth: '800px', background: 'transparent', boxShadow: 'none' } : {}}>
-        {!showVideoLayout ? (
-          <div className="call-dialog-body">
-            <div className="call-screen">
-              <div className="call-avatar">U</div>
-              <div className="call-name">User {call.toUserId === call.fromUserId ? '...' : (isIncoming ? call.fromUserId : call.toUserId)}</div>
-              <div className="call-status">{status}</div>
-              <div className="call-buttons">
-                {isIncoming && !connected && <button className="btn btn-primary" onClick={handleAccept}>Accept</button>}
-                <button className="call-end-btn" onClick={handleHangup}>✕</button>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="video-call-wrapper">
-            <video id="remote-video" ref={remoteVideoRef} autoPlay playsInline />
-            <video id="local-video" ref={localVideoRef} autoPlay playsInline muted onMouseDown={handleMouseDown} />
-            
-            {/* Overlay status for caller waiting */}
-            {!connected && !isIncoming && (
-               <div style={{position:'absolute', top:'50%', left:'50%', transform:'translate(-50%, -50%)', color:'white', background:'rgba(0,0,0,0.5)', padding:'10px 20px', borderRadius:'20px'}}>
-                 Calling...
-               </div>
-            )}
-
-            <div className="call-overlay-controls">
-              <button className="hangup" onClick={handleHangup}>✕</button>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function App() {
   const [user, setUser] = useState(null);
   const [chats, setChats] = useState([]);
   const [messages, setMessages] = useState({});
   const [activeChatId, setActiveChatId] = useState(null);
   const [chatKeys, setChatKeys] = useState({});
-  const [activeCall, setActiveCall] = useState(null); // { id, type, isIncoming }
   const [modals, setModals] = useState({ settings: false, newChat: false, admin: false, manageChat: null });
   const [inputText, setInputText] = useState("");
+  const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef(null);
 
   // Load Keys
@@ -422,21 +145,7 @@ function App() {
     });
   }, []);
 
-  // Polling for Calls
-  useEffect(() => {
-    if (!user) return;
-    const interval = setInterval(async () => {
-      try {
-        const res = await jsonFetch('/api/calls/pending');
-        if (res.calls && res.calls.length > 0 && !activeCall) {
-          setActiveCall({ ...res.calls[0], isIncoming: true });
-        }
-      } catch {}
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [user, activeCall]);
-
-  // Polling for Messages (Fixes flashing by comparing JSON)
+  // Polling for Messages (Fast polling 1s)
   useEffect(() => {
     if (!user) return;
     const pollMessages = async () => {
@@ -449,7 +158,7 @@ function App() {
       } catch (e) { console.error(e); }
     };
     pollMessages();
-    const interval = setInterval(pollMessages, 2000);
+    const interval = setInterval(pollMessages, 1000);
     return () => clearInterval(interval);
   }, [user]);
 
@@ -507,18 +216,69 @@ function App() {
     }
   };
 
-  const handleFileUpload = (e) => {
+  const handleFileUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    if (file.size > 500 * 1024) { // 500KB limit for GitHub storage safety
-      alert("File too large (max 500KB)");
+    
+    // Limit check (GitHub API limit is ~100MB, express limit 50MB)
+    if (file.size > 45 * 1024 * 1024) { 
+      alert("File too large (max 45MB)");
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      handleSendMessage(reader.result); // Send Data URL as message
-    };
-    reader.readAsDataURL(file);
+
+    if (!activeChatId) return;
+    const chat = chats.find(c => c.id === activeChatId);
+    if (!chat) return;
+    const keyEntry = chatKeys[chat.id];
+    if (!keyEntry || !keyEntry.code) {
+      alert("No key for this chat.");
+      return;
+    }
+
+    setUploading(true);
+    try {
+      // 1. Read File
+      const arrayBuffer = await file.arrayBuffer();
+      
+      // 2. Encrypt File
+      const key = await getAesKeyFromCode(keyEntry.code);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, arrayBuffer);
+      
+      // 3. Convert to Base64 for upload
+      const encryptedBase64 = bufToBase64(encryptedBuffer);
+      const ext = "." + (file.name.split('.').pop() || "dat");
+
+      // 4. Upload
+      const res = await jsonFetch('/api/upload', {
+        method: 'POST',
+        body: JSON.stringify({ content: encryptedBase64, ext })
+      });
+
+      // 5. Send Message with Link
+      // Format: FILE:<path>:<iv_base64>:<mime_type>:<original_name>
+      const fileMsg = `FILE:${res.path}:${bufToBase64(iv.buffer)}:${file.type}:${file.name}`;
+      
+      // Encrypt the message text itself (which contains the link)
+      const msgIv = crypto.getRandomValues(new Uint8Array(12));
+      const msgCipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv: msgIv }, key, enc.encode(fileMsg));
+
+      await jsonFetch('/api/messages', {
+        method: 'POST',
+        body: JSON.stringify({
+          chatId: chat.id,
+          ciphertext: bufToBase64(msgCipher),
+          iv: bufToBase64(msgIv.buffer)
+        })
+      });
+      
+      loadChats();
+    } catch (e) {
+      alert("Upload failed: " + e.message);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
   };
 
   const decryptMessage = async (chatId, msg) => {
@@ -538,14 +298,72 @@ function App() {
   // Sub-components for rendering
   const ChatMessage = ({ msg, chatId }) => {
     const [text, setText] = useState("...");
-    useEffect(() => { decryptMessage(chatId, msg).then(setText); }, [msg, chatId, chatKeys]);
+    const [fileUrl, setFileUrl] = useState(null);
+    const [isImage, setIsImage] = useState(false);
+    const [fileName, setFileName] = useState("");
+
+    useEffect(() => { 
+      decryptMessage(chatId, msg).then(async (decrypted) => {
+        if (decrypted.startsWith("FILE:")) {
+          // FILE:<path>:<iv>:<mime>:<name>
+          const parts = decrypted.split(":");
+          if (parts.length >= 5) {
+            const path = parts[1];
+            const ivB64 = parts[2];
+            const mime = parts[3];
+            const name = parts.slice(4).join(":");
+            
+            setFileName(name);
+            setText("Loading file...");
+            
+            try {
+              // Fetch encrypted file
+              const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
+              if (!res.ok) throw new Error("Fetch failed");
+              const encryptedBlob = await res.arrayBuffer();
+              
+              // Decrypt
+              const keyEntry = chatKeys[chatId];
+              const key = await getAesKeyFromCode(keyEntry.code);
+              const plainBuffer = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: new Uint8Array(base64ToBuf(ivB64)) },
+                key,
+                encryptedBlob
+              );
+              
+              const blob = new Blob([plainBuffer], { type: mime });
+              const url = URL.createObjectURL(blob);
+              setFileUrl(url);
+              if (mime.startsWith("image/")) setIsImage(true);
+              setText("");
+            } catch (e) {
+              setText("Error loading file");
+            }
+          } else {
+            setText(decrypted);
+          }
+        } else {
+          setText(decrypted);
+        }
+      }); 
+    }, [msg, chatId, chatKeys]);
+
     const isMe = msg.fromUserId === user.id;
-    const isImage = text.startsWith("data:image");
 
     return (
       <div className={`msg-row ${isMe ? 'me' : 'them'}`}>
         <div className={`msg-bubble ${isMe ? 'me' : 'them'}`}>
-          {isImage ? <img src={text} alt="Shared" className="msg-image" /> : text}
+          {fileUrl ? (
+            isImage ? (
+              <img src={fileUrl} alt={fileName} className="msg-image" />
+            ) : (
+              <a href={fileUrl} download={fileName} style={{color: isMe?'white':'black', textDecoration:'underline'}}>
+                📎 {fileName}
+              </a>
+            )
+          ) : (
+            text
+          )}
         </div>
       </div>
     );
@@ -572,24 +390,6 @@ function App() {
           <button className="btn-pill" onClick={() => setModals({ ...modals, settings: true })}>⚙️</button>
           <button id="btn-logout" onClick={() => { jsonFetch('/api/auth/logout', { method: 'POST' }); setUser(null); }}>Log Out</button>
         </div>
-      </div>
-
-      {/* Call Strip */}
-      <div className="call-strip">
-        <button className="call-button video" onClick={() => {
-          const target = prompt("Enter username to call:");
-          if (target) setActiveCall({ id: 'pending', type: 'video', toUserId: target, isIncoming: false });
-        }}>
-          <div className="icon-badge">🎥</div>
-          <span className="label"><span className="label-main">Video call</span></span>
-        </button>
-        <button className="call-button audio" onClick={() => {
-           const target = prompt("Enter username to call:");
-           if (target) setActiveCall({ id: 'pending', type: 'audio', toUserId: target, isIncoming: false });
-        }}>
-          <div className="icon-badge">📞</div>
-          <span className="label"><span className="label-main">Audio call</span></span>
-        </button>
       </div>
 
       {/* App Shell */}
@@ -624,8 +424,10 @@ function App() {
             {activeMsgs.map(m => <ChatMessage key={m.id} msg={m} chatId={activeChatId} />)}
           </div>
           <div className="chat-input-row">
-            <input type="file" ref={fileInputRef} style={{display:'none'}} accept="image/*" onChange={handleFileUpload} />
-            <button className="btn-icon" onClick={() => fileInputRef.current.click()}>📎</button>
+            <input type="file" ref={fileInputRef} style={{display:'none'}} onChange={handleFileUpload} />
+            <button className="btn-icon" onClick={() => fileInputRef.current.click()} disabled={uploading}>
+              {uploading ? "⏳" : "📎"}
+            </button>
             <input id="chat-input" value={inputText} onChange={e => setInputText(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSendMessage()} placeholder="Message" />
             <button id="btn-chat-send" onClick={() => handleSendMessage()}>Send</button>
           </div>
@@ -633,14 +435,6 @@ function App() {
       </div>
 
       {/* Modals */}
-      {activeCall && (
-        <CallOverlay 
-          call={activeCall.id === 'pending' ? { id: 'temp', ...activeCall } : activeCall} 
-          isIncoming={activeCall.isIncoming} 
-          onClose={() => setActiveCall(null)} 
-        />
-      )}
-
       {modals.newChat && (
         <Modal title="New Chat" onClose={() => setModals({ ...modals, newChat: false })}>
           <div className="modal-row">

@@ -581,7 +581,7 @@ function App() {
       <div className="top-bar">
         <div className="top-left">
           <div className="top-app-name">Talky</div>
-          <div className="top-app-sub">React Frontend</div>
+          <div className="top-app-sub">The most secure chat Firewall Freedom has made!</div>
         </div>
         <div className="top-right">
           <button className="btn-pill" onClick={() => setModals({ ...modals, network: true })}>

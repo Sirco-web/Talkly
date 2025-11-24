@@ -27,6 +27,19 @@ const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 const DATA_PATH = process.env.DATA_PATH || "talky/data.json";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-me-admin-pass";
 
+// --- Presence System (In-Memory) ---
+const userPresence = {}; // { userId: { status: 'online'|'away', lastSeen: number } }
+
+// Cleanup stale presence every 10 seconds
+setInterval(() => {
+  const now = Date.now();
+  for (const uid in userPresence) {
+    if (now - userPresence[uid].lastSeen > 30000) { // 30s timeout
+      delete userPresence[uid];
+    }
+  }
+}, 10000);
+
 // --- Security & Signup Logic ---
 const signupBlocks = new Map(); // IP -> Expiry Timestamp
 let currentSignupCode = generateSignupCode();
@@ -208,7 +221,7 @@ async function githubRequest(path, options = {}) {
 
 async function loadDB() {
   if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
-    return { users: [], chats: [], messages: [], globalPaused: { messages: false } };
+    return { users: [], chats: [], messages: [], requests: [], globalPaused: { messages: false } };
   }
 
   // Serve from cache if available and fresh enough (or if we just wrote to it)
@@ -230,6 +243,7 @@ async function loadDB() {
     if (!Array.isArray(json.users)) json.users = [];
     if (!Array.isArray(json.chats)) json.chats = [];
     if (!Array.isArray(json.messages)) json.messages = [];
+    if (!Array.isArray(json.requests)) json.requests = []; // Ensure requests array exists
     if (!json.globalPaused || typeof json.globalPaused !== "object")
       json.globalPaused = { messages: false };
 
@@ -240,12 +254,12 @@ async function loadDB() {
     return json;
   } catch (err) {
     if (String(err.message).includes("404")) {
-      return { users: [], chats: [], messages: [], globalPaused: { messages: false } };
+      return { users: [], chats: [], messages: [], requests: [], globalPaused: { messages: false } };
     }
     console.error("Failed to load DB from GitHub:", err);
     // Return cache if available even if expired, better than crashing
     if (dbCache) return JSON.parse(JSON.stringify(dbCache));
-    return { users: [], chats: [], messages: [], globalPaused: { messages: false } };
+    return { users: [], chats: [], messages: [], requests: [], globalPaused: { messages: false } };
   }
 }
 
@@ -320,6 +334,107 @@ app.post("/api/admin/login", (req, res) => {
   } else {
     res.status(401).json({ error: "Invalid admin password" });
   }
+});
+
+// NEW: Presence Heartbeat
+app.post("/api/presence", requireAuth, (req, res) => {
+  const { status } = req.body; // 'online' or 'away'
+  userPresence[req.session.userId] = { status, lastSeen: Date.now() };
+  res.json({ ok: true });
+});
+
+// NEW: Get All Presence
+app.get("/api/presence", requireAuth, (req, res) => {
+  res.json({ presence: userPresence });
+});
+
+// NEW: Get All Users (Network Discovery)
+app.get("/api/users", requireAuth, async (req, res) => {
+  const db = await loadDB();
+  // Return minimal info
+  const users = db.users.map(u => ({ id: u.id, username: u.username }));
+  res.json({ users });
+});
+
+// NEW: Chat Requests System
+app.get("/api/requests", requireAuth, async (req, res) => {
+  const db = await loadDB();
+  const myRequests = (db.requests || []).filter(r => r.toUserId === req.session.userId);
+  const enriched = myRequests.map(r => {
+    const sender = db.users.find(u => u.id === r.fromUserId);
+    return { ...r, senderName: sender ? sender.username : "Unknown" };
+  });
+  res.json({ requests: enriched });
+});
+
+app.post("/api/requests", requireAuth, async (req, res) => {
+  const { toUserId } = req.body;
+  const db = await loadDB();
+  if (!db.requests) db.requests = [];
+  
+  // Check if chat already exists
+  const existingChat = db.chats.find(c => 
+    c.type === 'dm' && 
+    c.participantIds.includes(req.session.userId) && 
+    c.participantIds.includes(toUserId)
+  );
+  if (existingChat) return res.status(400).json({ error: "Chat already exists" });
+
+  // Check if request already exists
+  const existingReq = db.requests.find(r => r.fromUserId === req.session.userId && r.toUserId === toUserId);
+  if (existingReq) return res.status(400).json({ error: "Request already sent" });
+
+  const reqObj = {
+    id: generateId("req"),
+    fromUserId: req.session.userId,
+    toUserId,
+    createdAt: new Date().toISOString()
+  };
+  db.requests.push(reqObj);
+  await saveDB(db);
+  res.json({ ok: true });
+});
+
+app.post("/api/requests/:id/accept", requireAuth, async (req, res) => {
+  const reqId = req.params.id;
+  const db = await loadDB();
+  if (!db.requests) db.requests = [];
+  const reqIndex = db.requests.findIndex(r => r.id === reqId);
+  if (reqIndex === -1) return res.status(404).json({ error: "Request not found" });
+  
+  const request = db.requests[reqIndex];
+  if (request.toUserId !== req.session.userId) return res.status(403).json({ error: "Not authorized" });
+
+  // Create Chat
+  const chat = {
+    id: generateId("c"),
+    name: "Direct Message", 
+    type: "dm",
+    participantIds: [request.fromUserId, request.toUserId],
+    encryption: { version: 1, keyHash: "manual-setup-required" },
+    createdAt: new Date().toISOString()
+  };
+  
+  db.chats.push(chat);
+  db.requests.splice(reqIndex, 1); // Remove request
+  await saveDB(db);
+  res.json({ chat });
+});
+
+app.post("/api/requests/:id/decline", requireAuth, async (req, res) => {
+  const reqId = req.params.id;
+  const db = await loadDB();
+  if (!db.requests) db.requests = [];
+  const reqIndex = db.requests.findIndex(r => r.id === reqId);
+  
+  if (reqIndex !== -1) {
+    const request = db.requests[reqIndex];
+    if (request.toUserId === req.session.userId || request.fromUserId === req.session.userId) {
+      db.requests.splice(reqIndex, 1);
+      await saveDB(db);
+    }
+  }
+  res.json({ ok: true });
 });
 
 // NEW: Get Signup Code (Admin Only)

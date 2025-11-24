@@ -130,11 +130,17 @@ function App() {
   const [messages, setMessages] = useState({});
   const [activeChatId, setActiveChatId] = useState(null);
   const [chatKeys, setChatKeys] = useState({});
-  const [modals, setModals] = useState({ settings: false, newChat: false, admin: false, manageChat: null, chatParticipants: null });
+  const [modals, setModals] = useState({ settings: false, newChat: false, admin: false, manageChat: null, chatParticipants: null, network: false });
   const [inputText, setInputText] = useState("");
   const [uploading, setUploading] = useState(false);
   const [adminCode, setAdminCode] = useState(null); // For admin modal
   
+  // Presence & Network
+  const [presence, setPresence] = useState({});
+  const [networkUsers, setNetworkUsers] = useState([]);
+  const [myRequests, setMyRequests] = useState([]);
+  const [networkTab, setNetworkTab] = useState('users'); // 'users' or 'requests'
+
   // Theme State
   const [theme, setTheme] = useState({
     name: 'light',
@@ -195,6 +201,55 @@ function App() {
     setChatKeys(newKeys);
     localStorage.setItem("talky_chat_keys", JSON.stringify(newKeys));
   };
+
+  // --- Presence Logic ---
+  useEffect(() => {
+    if (!user) return;
+
+    const sendHeartbeat = (status) => {
+      jsonFetch('/api/presence', { method: 'POST', body: JSON.stringify({ status }) }).catch(() => {});
+    };
+
+    const handleVisibility = () => {
+      sendHeartbeat(document.hidden ? 'away' : 'online');
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', () => sendHeartbeat('online'));
+    window.addEventListener('blur', () => sendHeartbeat('away'));
+
+    // Initial heartbeat
+    sendHeartbeat('online');
+
+    // Periodic heartbeat & fetch
+    const interval = setInterval(() => {
+      sendHeartbeat(document.hidden ? 'away' : 'online');
+      jsonFetch('/api/presence').then(res => setPresence(res.presence || {}));
+    }, 5000); // 5s interval
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', () => sendHeartbeat('online'));
+      window.removeEventListener('blur', () => sendHeartbeat('away'));
+      clearInterval(interval);
+    };
+  }, [user]);
+
+  // Load Network Data
+  const loadNetwork = async () => {
+    try {
+      const [uRes, rRes] = await Promise.all([
+        jsonFetch('/api/users'),
+        jsonFetch('/api/requests')
+      ]);
+      setNetworkUsers(uRes.users || []);
+      setMyRequests(rRes.requests || []);
+    } catch (e) { console.error(e); }
+  };
+
+  useEffect(() => {
+    if (modals.network) loadNetwork();
+  }, [modals.network]);
 
   // Request Notification Permission
   useEffect(() => {
@@ -432,6 +487,15 @@ function App() {
     } catch { return "🔒 Decrypt Failed"; }
   };
 
+  // Helper to get status color
+  const getStatusColor = (uid) => {
+    const p = presence[uid];
+    if (!p) return '#8e8e93'; // Gray (Offline)
+    if (p.status === 'online') return '#34c759'; // Green
+    if (p.status === 'away') return '#ffcc00'; // Yellow
+    return '#8e8e93';
+  };
+
   // Sub-components for rendering
   const ChatMessage = ({ msg, chatId }) => {
     const [text, setText] = useState("...");
@@ -520,6 +584,9 @@ function App() {
           <div className="top-app-sub">React Frontend</div>
         </div>
         <div className="top-right">
+          <button className="btn-pill" onClick={() => setModals({ ...modals, network: true })}>
+            🌐 Network {myRequests.length > 0 && <span style={{background:'red', color:'white', borderRadius:'50%', padding:'2px 6px', fontSize:'10px'}}>{myRequests.length}</span>}
+          </button>
           <div className="user-pill">
             <div className="user-pill-main">{user.username}</div>
             <div className="user-pill-sub">ID: {user.id}</div>
@@ -538,15 +605,32 @@ function App() {
           </div>
           <div className="chat-search"><input placeholder="Search chats" /></div>
           <div id="chat-items">
-            {chats.map(chat => (
-              <div key={chat.id} className={`chat-item ${activeChatId === chat.id ? 'active' : ''}`} onClick={() => setActiveChatId(chat.id)}>
-                <div className="chat-avatar">{chat.name.slice(0, 2).toUpperCase()}</div>
-                <div className="chat-text">
-                  <div className="chat-name">{chat.name}</div>
-                  <div className="chat-last-message">Click to view</div>
+            {chats.map(chat => {
+              // Determine status dot for DMs
+              let statusColor = null;
+              if (chat.type === 'dm' && chat.participants) {
+                const other = chat.participants.find(p => p.id !== user.id);
+                if (other) statusColor = getStatusColor(other.id);
+              }
+
+              return (
+                <div key={chat.id} className={`chat-item ${activeChatId === chat.id ? 'active' : ''}`} onClick={() => setActiveChatId(chat.id)}>
+                  <div className="chat-avatar" style={{position:'relative'}}>
+                    {chat.name.slice(0, 2).toUpperCase()}
+                    {statusColor && (
+                      <div style={{
+                        position: 'absolute', bottom: 0, right: 0, width: '10px', height: '10px', 
+                        borderRadius: '50%', backgroundColor: statusColor, border: '2px solid var(--bg)'
+                      }} />
+                    )}
+                  </div>
+                  <div className="chat-text">
+                    <div className="chat-name">{chat.name}</div>
+                    <div className="chat-last-message">Click to view</div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -572,6 +656,69 @@ function App() {
       </div>
 
       {/* Modals */}
+      {modals.network && (
+        <Modal title="Network & Requests" onClose={() => setModals({ ...modals, network: false })}>
+          <div className="auth-tabs" style={{marginBottom: '15px'}}>
+            <div className={`auth-tab ${networkTab==='users'?'active':''}`} onClick={()=>setNetworkTab('users')}>All Users</div>
+            <div className={`auth-tab ${networkTab==='requests'?'active':''}`} onClick={()=>setNetworkTab('requests')}>
+              Requests {myRequests.length > 0 && `(${myRequests.length})`}
+            </div>
+          </div>
+
+          {networkTab === 'users' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '300px', overflowY: 'auto' }}>
+              {networkUsers.filter(u => u.id !== user.id).map(u => (
+                <div key={u.id} style={{ padding: '10px', background: 'var(--bg)', borderRadius: '10px', border: '1px solid var(--border-subtle)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                  <div style={{display:'flex', alignItems:'center', gap:'10px'}}>
+                    <div style={{width:'10px', height:'10px', borderRadius:'50%', background: getStatusColor(u.id)}} />
+                    <div>
+                      <div style={{ fontWeight: '600', fontSize: '14px' }}>{u.username}</div>
+                      <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>ID: {u.id}</div>
+                    </div>
+                  </div>
+                  <button className="btn-pill" onClick={async () => {
+                    try {
+                      await jsonFetch('/api/requests', { method: 'POST', body: JSON.stringify({ toUserId: u.id }) });
+                      alert("Request sent!");
+                    } catch (e) { alert(e.message); }
+                  }}>Request Chat</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {networkTab === 'requests' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '300px', overflowY: 'auto' }}>
+              {myRequests.length === 0 && <div style={{padding:'20px', textAlign:'center', color:'var(--text-muted)'}}>No pending requests</div>}
+              {myRequests.map(req => (
+                <div key={req.id} style={{ padding: '10px', background: 'var(--bg)', borderRadius: '10px', border: '1px solid var(--border-subtle)' }}>
+                  <div style={{marginBottom:'8px'}}>
+                    <span style={{fontWeight:'bold'}}>{req.senderName}</span> wants to chat.
+                  </div>
+                  <div style={{display:'flex', gap:'10px'}}>
+                    <button className="btn-primary" onClick={async () => {
+                      try {
+                        const res = await jsonFetch(`/api/requests/${req.id}/accept`, { method: 'POST' });
+                        alert("Accepted! Please set an encryption key manually in Manage Chat.");
+                        loadChats(); loadNetwork();
+                      } catch (e) { alert(e.message); }
+                    }}>Accept</button>
+                    <button className="btn-pill" onClick={async () => {
+                      await jsonFetch(`/api/requests/${req.id}/decline`, { method: 'POST' });
+                      loadNetwork();
+                    }}>Decline</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          
+          <div className="modal-actions">
+            <button className="btn-primary" onClick={() => setModals({ ...modals, network: false })}>Close</button>
+          </div>
+        </Modal>
+      )}
+
       {modals.newChat && (
         <Modal title="New Chat" onClose={() => setModals({ ...modals, newChat: false })}>
           <div className="modal-row">

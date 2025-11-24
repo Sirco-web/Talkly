@@ -106,45 +106,45 @@ const ChatMessage = React.memo(({ msg, chatId, onResize, userId, chatKeys }) => 
             loadedRef.current = true;
             onResize && onResize();
           }
-        } else if (decrypted.startsWith("data:image")) {
-          setFileUrl(decrypted);
-          setIsImage(true);
-          setFileName("image.png");
-          setText("");
-          loadedRef.current = true;
-          } else {
-            setText(decrypted);
-            loadedRef.current = true;
-            onResize && onResize();
-          }
         } else {
           setText(decrypted);
           loadedRef.current = true;
           onResize && onResize();
         }
-      });
-    }, [msg.id, chatId, chatKeys, onResize]);
+      } else if (decrypted.startsWith("data:image")) {
+        setFileUrl(decrypted);
+        setIsImage(true);
+        setFileName("image.png");
+        setText("");
+        loadedRef.current = true;
+      } else {
+        setText(decrypted);
+        loadedRef.current = true;
+        onResize && onResize();
+      }
+    });
+  }, [msg.id, chatId, chatKeys, onResize]);
 
-    const isMe = msg.fromUserId === userId;
+  const isMe = msg.fromUserId === userId;
 
-    return (
-      <div className={`msg-row ${isMe ? 'me' : 'them'}`}>
-        <div className={`msg-bubble ${isMe ? 'me' : 'them'}`}>
-          {fileUrl ? (
-            isImage ? (
-              <img src={fileUrl} alt={fileName} className="msg-image" onLoad={onResize} />
-            ) : (
-              <a href={fileUrl} download={fileName} style={{color: isMe?'white':'black', textDecoration:'underline'}}>
-                📎 {fileName}
-              </a>
-            )
+  return (
+    <div className={`msg-row ${isMe ? 'me' : 'them'}`}>
+      <div className={`msg-bubble ${isMe ? 'me' : 'them'}`}>
+        {fileUrl ? (
+          isImage ? (
+            <img src={fileUrl} alt={fileName} className="msg-image" onLoad={onResize} />
           ) : (
-            text
-          )}
-        </div>
+            <a href={fileUrl} download={fileName} style={{color: isMe?'white':'black', textDecoration:'underline'}}>
+              📎 {fileName}
+            </a>
+          )
+        ) : (
+          text
+        )}
       </div>
-    );
-  });
+    </div>
+  );
+});
 
 function Modal({ title, onClose, children }) {
   return (

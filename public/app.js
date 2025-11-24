@@ -1,4 +1,5 @@
 // app.js - Talky front-end (GitHub-backed, encrypted chats, call signaling)
+// NOTE: If server logs show "Unexpected end of JSON input", you must fix loadDB() in server.js to handle empty strings (return default DB).
 
 const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
@@ -8,7 +9,11 @@ async function jsonFetch(url, options = {}) {
   const headers = { "Content-Type": "application/json", ...options.headers };
   const res = await fetch(url, { credentials: "same-origin", ...options, headers });
   let data; try { data = await res.json(); } catch { data = null; }
-  if (!res.ok) { const msg = (data && data.error) || `Request failed (${res.status})`; throw new Error(msg); }
+  if (!res.ok) { 
+    const msg = (data && data.error) || `Request failed (${res.status})`; 
+    if (res.status === 500) console.warn("Server 500 Error: Check server logs. Likely DB load error (empty file).");
+    throw new Error(msg); 
+  }
   return data;
 }
 

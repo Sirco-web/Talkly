@@ -240,7 +240,14 @@ async function loadDB() {
       )}?ref=${encodeURIComponent(GITHUB_BRANCH)}`
     );
     const content = Buffer.from(file.content, "base64").toString("utf8");
-    const json = JSON.parse(content);
+    
+    let json;
+    if (!content || !content.trim()) {
+      // Handle empty file gracefully
+      json = { users: [], chats: [], messages: [], requests: [], globalPaused: { messages: false } };
+    } else {
+      json = JSON.parse(content);
+    }
 
     json._sha = file.sha;
     if (!Array.isArray(json.users)) json.users = [];

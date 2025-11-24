@@ -245,6 +245,8 @@ function App() {
   const [inputText, setInputText] = useState("");
   const [uploading, setUploading] = useState(false);
   const [adminCode, setAdminCode] = useState(null); // For admin modal
+  const [adminTab, setAdminTab] = useState('system'); // system, users, chats
+  const [adminData, setAdminData] = useState({ users: [], chats: [], system: {} });
   
   // Presence & Network
   const [presence, setPresence] = useState({});
@@ -259,6 +261,8 @@ function App() {
     bgAlt: '#ffffff',
     textMain: '#111111',
     primary: '#007aff',
+    bubbleMe: '#007aff',
+    bubbleThem: '#e5e5ea',
     bgImage: ''
   });
 
@@ -291,6 +295,8 @@ function App() {
     root.style.setProperty('--bg-alt', t.bgAlt);
     root.style.setProperty('--text-main', t.textMain);
     root.style.setProperty('--primary', t.primary);
+    root.style.setProperty('--bubble-me', t.bubbleMe || '#007aff');
+    root.style.setProperty('--bubble-them', t.bubbleThem || '#e5e5ea');
     
     if (t.bgImage) {
       document.body.style.backgroundImage = `url('${t.bgImage}')`;
@@ -629,13 +635,13 @@ function App() {
           <div className="top-app-sub">The most secure chat Firewall Freedom has made!</div>
         </div>
         <div className="top-right">
-          <button className="btn-pill" onClick={() => setModals({ ...modals, network: true })}>
-            🌐 Network {myRequests.length > 0 && <span style={{background:'red', color:'white', borderRadius:'50%', padding:'2px 6px', fontSize:'10px'}}>{myRequests.length}</span>}
-          </button>
           <div className="user-pill">
             <div className="user-pill-main">{user.username}</div>
             <div className="user-pill-sub">ID: {user.id}</div>
           </div>
+          <button className="btn-pill" onClick={() => setModals({ ...modals, network: true })}>
+            🌐 Network {myRequests.length > 0 && <span style={{background:'red', color:'white', borderRadius:'50%', padding:'2px 6px', fontSize:'10px'}}>{myRequests.length}</span>}
+          </button>
           <button className="btn-pill" onClick={() => setModals({ ...modals, settings: true })}>⚙️</button>
           <button id="btn-logout" onClick={() => { jsonFetch('/api/auth/logout', { method: 'POST' }); setUser(null); }}>Log Out</button>
         </div>
@@ -837,9 +843,12 @@ function App() {
         <Modal title="Participants" onClose={() => setModals({ ...modals, chatParticipants: null })}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '300px', overflowY: 'auto' }}>
             {modals.chatParticipants.map(p => (
-              <div key={p.id} style={{ padding: '10px', background: '#f5f5f7', borderRadius: '10px', border: '1px solid #e5e5ea' }}>
-                <div style={{ fontWeight: '600', fontSize: '14px' }}>{p.username}</div>
-                <div style={{ fontSize: '11px', color: '#666', fontFamily: 'monospace', marginTop: '2px' }}>ID: {p.id}</div>
+              <div key={p.id} style={{ padding: '10px', background: 'var(--bg)', borderRadius: '10px', border: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{width:'10px', height:'10px', borderRadius:'50%', background: getStatusColor(p.id)}} />
+                <div>
+                  <div style={{ fontWeight: '600', fontSize: '14px' }}>{p.username}</div>
+                  <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'monospace', marginTop: '2px' }}>ID: {p.id}</div>
+                </div>
               </div>
             ))}
           </div>
@@ -854,11 +863,11 @@ function App() {
            <div className="settings-section">
              <h3>🎨 Appearance</h3>
              <div className="theme-grid">
-               <button className="btn-pill" onClick={() => updateTheme({ name: 'light', bg: '#f5f5f7', bgAlt: '#ffffff', textMain: '#111111', primary: '#007aff', bgImage: '' })}>Light</button>
-               <button className="btn-pill" onClick={() => updateTheme({ name: 'dark', bg: '#1c1c1e', bgAlt: '#2c2c2e', textMain: '#ffffff', primary: '#0a84ff', bgImage: '' })}>Dark</button>
-               <button className="btn-pill" onClick={() => updateTheme({ name: 'midnight', bg: '#000000', bgAlt: '#111111', textMain: '#e5e5ea', primary: '#007aff', bgImage: '' })}>Midnight</button>
-               <button className="btn-pill" onClick={() => updateTheme({ name: 'forest', bg: '#1a2f1a', bgAlt: '#243d24', textMain: '#e0ffe0', primary: '#4cd964', bgImage: '' })}>Forest</button>
-               <button className="btn-pill" onClick={() => updateTheme({ name: 'sunset', bg: '#2b1b1b', bgAlt: '#3d2424', textMain: '#ffe0e0', primary: '#ff9500', bgImage: '' })}>Sunset</button>
+               <button className="btn-pill" onClick={() => updateTheme({ name: 'light', bg: '#f5f5f7', bgAlt: '#ffffff', textMain: '#111111', primary: '#007aff', bubbleMe: '#007aff', bubbleThem: '#e5e5ea', bgImage: '' })}>Light</button>
+               <button className="btn-pill" onClick={() => updateTheme({ name: 'dark', bg: '#1c1c1e', bgAlt: '#2c2c2e', textMain: '#ffffff', primary: '#0a84ff', bubbleMe: '#0a84ff', bubbleThem: '#3a3a3c', bgImage: '' })}>Dark</button>
+               <button className="btn-pill" onClick={() => updateTheme({ name: 'midnight', bg: '#000000', bgAlt: '#111111', textMain: '#e5e5ea', primary: '#007aff', bubbleMe: '#007aff', bubbleThem: '#1c1c1e', bgImage: '' })}>Midnight</button>
+               <button className="btn-pill" onClick={() => updateTheme({ name: 'forest', bg: '#1a2f1a', bgAlt: '#243d24', textMain: '#e0ffe0', primary: '#4cd964', bubbleMe: '#4cd964', bubbleThem: '#2c4c2c', bgImage: '' })}>Forest</button>
+               <button className="btn-pill" onClick={() => updateTheme({ name: 'sunset', bg: '#2b1b1b', bgAlt: '#3d2424', textMain: '#ffe0e0', primary: '#ff9500', bubbleMe: '#ff9500', bubbleThem: '#4d2e2e', bgImage: '' })}>Sunset</button>
              </div>
              
              <div className="modal-row" style={{marginTop: '10px'}}>
@@ -876,6 +885,14 @@ function App() {
              <div className="modal-row">
                <div>Text Color</div>
                <input type="color" value={theme.textMain} onChange={e => updateTheme({ ...theme, name: 'custom', textMain: e.target.value })} />
+             </div>
+             <div className="modal-row">
+               <div>My Bubble Color</div>
+               <input type="color" value={theme.bubbleMe || '#007aff'} onChange={e => updateTheme({ ...theme, name: 'custom', bubbleMe: e.target.value })} />
+             </div>
+             <div className="modal-row">
+               <div>Their Bubble Color</div>
+               <input type="color" value={theme.bubbleThem || '#e5e5ea'} onChange={e => updateTheme({ ...theme, name: 'custom', bubbleThem: e.target.value })} />
              </div>
            </div>
 
@@ -933,13 +950,119 @@ function App() {
 
       {modals.admin && (
         <Modal title="Admin Panel" onClose={() => setModals({ ...modals, admin: false })}>
-          <div className="modal-row">
-            <div style={{fontWeight:'bold'}}>Current Signup Code:</div>
-            <div style={{fontSize:'24px', fontFamily:'monospace', padding:'10px', background:'#eee', borderRadius:'8px', textAlign:'center', letterSpacing:'2px'}}>
-              {adminCode || "Loading..."}
-            </div>
-            <div style={{fontSize:'11px', color:'#666'}}>Share this code with new users. It rotates every hour.</div>
+          <div className="auth-tabs" style={{marginBottom: '15px'}}>
+            <div className={`auth-tab ${adminTab==='system'?'active':''}`} onClick={()=>setAdminTab('system')}>System</div>
+            <div className={`auth-tab ${adminTab==='users'?'active':''}`} onClick={()=>{
+              setAdminTab('users');
+              jsonFetch('/api/admin/users').then(res => setAdminData(d => ({...d, users: res.users})));
+            }}>Users</div>
+            <div className={`auth-tab ${adminTab==='chats'?'active':''}`} onClick={()=>{
+              setAdminTab('chats');
+              jsonFetch('/api/admin/chats').then(res => setAdminData(d => ({...d, chats: res.chats})));
+            }}>Chats</div>
           </div>
+
+          {adminTab === 'system' && (
+            <div className="modal-row">
+              <div style={{fontWeight:'bold'}}>Signup Code</div>
+              <div style={{fontSize:'18px', fontFamily:'monospace', padding:'8px', background:'#eee', borderRadius:'8px', textAlign:'center'}}>
+                {adminCode || "Loading..."}
+              </div>
+              
+              <div style={{marginTop:'20px', fontWeight:'bold'}}>Maintenance</div>
+              <button className="modal-menu-btn danger" onClick={async () => {
+                if(confirm("Force logout ALL users? They will need to log in again.")) {
+                  await jsonFetch('/api/admin/system/logout-all', { method: 'POST' });
+                  alert("All users logged out.");
+                }
+              }}>⚠️ Force Logout Everyone</button>
+              
+              <div style={{display:'flex', gap:'10px', marginTop:'10px'}}>
+                 <button className="btn-pill" onClick={() => {
+                    jsonFetch('/api/admin/system/maintenance', { method: 'POST', body: JSON.stringify({ login: true }) });
+                    alert("Login Disabled");
+                 }}>Disable Login</button>
+                 <button className="btn-pill" onClick={() => {
+                    jsonFetch('/api/admin/system/maintenance', { method: 'POST', body: JSON.stringify({ login: false }) });
+                    alert("Login Enabled");
+                 }}>Enable Login</button>
+              </div>
+              <div style={{display:'flex', gap:'10px', marginTop:'10px'}}>
+                 <button className="btn-pill" onClick={() => {
+                    jsonFetch('/api/admin/system/maintenance', { method: 'POST', body: JSON.stringify({ signup: true }) });
+                    alert("Signup Disabled");
+                 }}>Disable Signup</button>
+                 <button className="btn-pill" onClick={() => {
+                    jsonFetch('/api/admin/system/maintenance', { method: 'POST', body: JSON.stringify({ signup: false }) });
+                    alert("Signup Enabled");
+                 }}>Enable Signup</button>
+              </div>
+              <div style={{display:'flex', gap:'10px', marginTop:'10px'}}>
+                 <button className="btn-pill" onClick={() => {
+                    jsonFetch('/api/admin/system/maintenance', { method: 'POST', body: JSON.stringify({ messages: true }) });
+                    alert("Messaging Disabled");
+                 }}>Disable Msgs</button>
+                 <button className="btn-pill" onClick={() => {
+                    jsonFetch('/api/admin/system/maintenance', { method: 'POST', body: JSON.stringify({ messages: false }) });
+                    alert("Messaging Enabled");
+                 }}>Enable Msgs</button>
+              </div>
+            </div>
+          )}
+
+          {adminTab === 'users' && (
+            <div>
+              <button className="btn-primary" style={{marginBottom:'10px'}} onClick={async () => {
+                const u = prompt("Username:");
+                const p = prompt("Password:");
+                if(u && p) {
+                  try {
+                    await jsonFetch('/api/admin/users', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
+                    const res = await jsonFetch('/api/admin/users');
+                    setAdminData(d => ({...d, users: res.users}));
+                  } catch(e) { alert(e.message); }
+                }
+              }}>+ Add User</button>
+              <div style={{maxHeight:'300px', overflowY:'auto'}}>
+                {adminData.users.map(u => (
+                  <div key={u.id} style={{padding:'8px', borderBottom:'1px solid #eee', display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                    <div>
+                      <div style={{fontWeight:'bold'}}>{u.username} {u.isAdmin && '👑'}</div>
+                      <div style={{fontSize:'10px', color:'#666'}}>{u.id}</div>
+                    </div>
+                    <button className="btn-pill" style={{color:'red', borderColor:'red'}} onClick={async () => {
+                      if(confirm(`Delete ${u.username}?`)) {
+                        await jsonFetch(`/api/admin/users/${u.id}`, { method: 'DELETE' });
+                        const res = await jsonFetch('/api/admin/users');
+                        setAdminData(d => ({...d, users: res.users}));
+                      }
+                    }}>Delete</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {adminTab === 'chats' && (
+            <div style={{maxHeight:'300px', overflowY:'auto'}}>
+               {adminData.chats.map(c => (
+                  <div key={c.id} style={{padding:'8px', borderBottom:'1px solid #eee', display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                    <div>
+                      <div style={{fontWeight:'bold'}}>{c.name}</div>
+                      <div style={{fontSize:'10px', color:'#666'}}>{c.participants} users • {c.msgCount} msgs</div>
+                    </div>
+                    <button className="btn-pill" style={{color:'red', borderColor:'red'}} onClick={async () => {
+                      if(confirm(`Delete chat ${c.name}?`)) {
+                        await jsonFetch(`/api/admin/chats/${c.id}`, { method: 'DELETE' });
+                        const res = await jsonFetch('/api/admin/chats');
+                        setAdminData(d => ({...d, chats: res.chats}));
+                      }
+                    }}>Delete</button>
+                  </div>
+                ))}
+            </div>
+          )}
+
           <div className="modal-actions">
             <button className="btn-primary" onClick={() => setModals({ ...modals, admin: false })}>Close</button>
           </div>

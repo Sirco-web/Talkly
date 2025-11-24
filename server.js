@@ -44,7 +44,7 @@ setInterval(() => {
 }, 10000);
 
 // --- Security & Signup Logic ---
-const signupBlocks = new Map(); // IP -> Expiry Timestamp
+// Removed IP-based map
 let currentSignupCode = generateSignupCode();
 
 // Rotate code every hour
@@ -172,6 +172,19 @@ app.use(
 
 app.use(express.static(path.join(__dirname, "public")));
 
+// Helper to parse cookies manually since we don't have cookie-parser
+function parseCookies(request) {
+  const list = {};
+  const rc = request.headers.cookie;
+  if (rc) {
+    rc.split(';').forEach((cookie) => {
+      const parts = cookie.split('=');
+      list[parts.shift().trim()] = decodeURI(parts.join('='));
+    });
+  }
+  return list;
+}
+
 function generateId(prefix) {
   const rnd = crypto.randomBytes(4).toString("hex");
   return `${prefix}_${rnd}`;
@@ -255,7 +268,8 @@ async function loadDB() {
     if (!Array.isArray(json.messages)) json.messages = [];
     if (!Array.isArray(json.requests)) json.requests = []; // Ensure requests array exists
     if (!json.globalPaused || typeof json.globalPaused !== "object")
-      json.globalPaused = { messages: false };
+      json.globalPaused = { messages: false, login: false, signup: false };
+    if (!json.globalLogoutAt) json.globalLogoutAt = 0;
 
     // Update cache
     dbCache = json;
@@ -321,6 +335,14 @@ function requireAuth(req, res, next) {
   if (!req.session || !req.session.userId) {
     return res.status(401).json({ error: "Not authenticated" });
   }
+  
+  // Check for forced logout
+  const db = await loadDB();
+  if (db.globalLogoutAt && req.session.loginTime && req.session.loginTime < db.globalLogoutAt) {
+     req.session.destroy();
+     return res.status(401).json({ error: "Session expired (Global Logout)" });
+  }
+
   next();
 }
 
@@ -519,23 +541,20 @@ app.post("/api/me/password", requireAuth, async (req, res) => {
 
 app.post("/api/auth/signup", async (req, res) => {
   const { username, password, code } = req.body || {};
-  const ip = req.ip || req.connection.remoteAddress;
-
-  // Check Block
-  if (signupBlocks.has(ip)) {
-    const expiry = signupBlocks.get(ip);
-    if (Date.now() < expiry) {
-      const remaining = Math.ceil((expiry - Date.now()) / 60000);
-      return res.status(403).json({ error: `Too many failed attempts. Try again in ${remaining} minutes.` });
-    } else {
-      signupBlocks.delete(ip);
-    }
+  
+  // Check Cookie Block
+  const cookies = parseCookies(req);
+  const blockTime = cookies['talky_signup_block'];
+  if (blockTime && parseInt(blockTime) > Date.now()) {
+    const remaining = Math.ceil((parseInt(blockTime) - Date.now()) / 60000);
+    return res.status(403).json({ error: `Too many failed attempts. Try again in ${remaining} minutes.` });
   }
 
   // Validate Code
   if (!code || code !== currentSignupCode) {
     // Block for 2 hours 30 minutes (150 minutes)
-    signupBlocks.set(ip, Date.now() + (150 * 60 * 1000));
+    const expiry = Date.now() + (150 * 60 * 1000);
+    res.cookie('talky_signup_block', expiry.toString(), { maxAge: 150 * 60 * 1000, httpOnly: true });
     return res.status(403).json({ error: "Invalid invite code. You are blocked for 2.5 hours." });
   }
 
@@ -547,6 +566,11 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 
   const db = await loadDB();
+
+  if (db.globalPaused && db.globalPaused.signup) {
+    return res.status(503).json({ error: "Signups are currently disabled." });
+  }
+
   const existing = db.users.find(
     (u) => u.username.toLowerCase() === username.toLowerCase()
   );
@@ -571,6 +595,7 @@ app.post("/api/auth/signup", async (req, res) => {
 
   req.session.userId = user.id;
   req.session.isAdmin = user.isAdmin;
+  req.session.loginTime = Date.now();
 
   res.status(201).json({
     user: {
@@ -588,6 +613,11 @@ app.post("/api/auth/login", async (req, res) => {
   }
 
   const db = await loadDB();
+
+  if (db.globalPaused && db.globalPaused.login && !user.isAdmin) { // Admins can still login
+     return res.status(503).json({ error: "Login is currently disabled." });
+  }
+
   const user = db.users.find(
     (u) => u.username.toLowerCase() === username.toLowerCase()
   );
@@ -601,6 +631,7 @@ app.post("/api/auth/login", async (req, res) => {
 
   req.session.userId = user.id;
   req.session.isAdmin = !!user.isAdmin;
+  req.session.loginTime = Date.now();
 
   res.json({
     user: {
@@ -917,6 +948,102 @@ app.post("/api/chats/:id/rotate", requireAuth, async (req, res) => {
 
   await saveDB(db);
   res.json({ chat: newChat });
+});
+
+// NEW: Admin System Management
+app.get("/api/admin/system", requireAdmin, async (req, res) => {
+  const db = await loadDB();
+  res.json({ 
+    globalPaused: db.globalPaused || {},
+    globalLogoutAt: db.globalLogoutAt || 0
+  });
+});
+
+app.post("/api/admin/system/maintenance", requireAdmin, async (req, res) => {
+  const { login, signup, messages } = req.body;
+  const db = await loadDB();
+  db.globalPaused = { ...db.globalPaused, ...req.body };
+  await saveDB(db);
+  res.json({ globalPaused: db.globalPaused });
+});
+
+app.post("/api/admin/system/logout-all", requireAdmin, async (req, res) => {
+  const db = await loadDB();
+  db.globalLogoutAt = Date.now();
+  await saveDB(db);
+  res.json({ ok: true, globalLogoutAt: db.globalLogoutAt });
+});
+
+// NEW: Admin User Management
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
+  const db = await loadDB();
+  const users = db.users.map(u => ({ 
+    id: u.id, 
+    username: u.username, 
+    isAdmin: u.isAdmin, 
+    createdAt: u.createdAt 
+  }));
+  res.json({ users });
+});
+
+app.post("/api/admin/users", requireAdmin, async (req, res) => {
+  const { username, password, isAdmin } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Missing fields" });
+  
+  const db = await loadDB();
+  if (db.users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
+    return res.status(409).json({ error: "Username taken" });
+  }
+  
+  const newUser = {
+    id: generateId("u"),
+    username,
+    passwordHash: createPasswordHash(password),
+    isAdmin: !!isAdmin,
+    createdAt: new Date().toISOString()
+  };
+  db.users.push(newUser);
+  await saveDB(db);
+  res.json({ user: { id: newUser.id, username: newUser.username } });
+});
+
+app.delete("/api/admin/users/:id", requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const db = await loadDB();
+  const idx = db.users.findIndex(u => u.id === id);
+  if (idx === -1) return res.status(404).json({ error: "User not found" });
+  
+  // Prevent deleting self
+  if (id === req.session.userId) return res.status(400).json({ error: "Cannot delete yourself" });
+  
+  db.users.splice(idx, 1);
+  await saveDB(db);
+  res.json({ ok: true });
+});
+
+// NEW: Admin Chat Management
+app.get("/api/admin/chats", requireAdmin, async (req, res) => {
+  const db = await loadDB();
+  const chats = db.chats.map(c => ({
+    id: c.id,
+    name: c.name,
+    type: c.type,
+    participants: c.participantIds.length,
+    msgCount: db.messages.filter(m => m.chatId === c.id).length
+  }));
+  res.json({ chats });
+});
+
+app.delete("/api/admin/chats/:id", requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const db = await loadDB();
+  const idx = db.chats.findIndex(c => c.id === id);
+  if (idx === -1) return res.status(404).json({ error: "Chat not found" });
+  
+  db.chats.splice(idx, 1);
+  db.messages = db.messages.filter(m => m.chatId !== id);
+  await saveDB(db);
+  res.json({ ok: true });
 });
 
 // NEW: Get participants of a chat

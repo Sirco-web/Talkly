@@ -40,6 +40,105 @@ function bytesToHex(bytes) { return Array.from(bytes).map((b) => b.toString(16).
 
 // --- Components ---
 
+// Moved outside App to prevent remounting on every render (Fixes image reloading/flickering)
+const ChatMessage = React.memo(({ msg, chatId, onResize, userId, chatKeys }) => {
+  const [text, setText] = useState("...");
+  const [fileUrl, setFileUrl] = useState(null);
+  const [isImage, setIsImage] = useState(false);
+  const [fileName, setFileName] = useState("");
+  const loadedRef = useRef(false);
+
+  useEffect(() => {
+    if (loadedRef.current) return;
+    onResize && onResize();
+
+    const decrypt = async () => {
+      const keyEntry = chatKeys[chatId];
+      if (!keyEntry) return "🔒 Encrypted";
+      try {
+        const key = await getAesKeyFromCode(keyEntry.code);
+        const plain = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: new Uint8Array(base64ToBuf(msg.iv)) },
+          key,
+          base64ToBuf(msg.ciphertext)
+        );
+        return dec.decode(plain);
+      } catch { return "🔒 Decrypt Failed"; }
+    };
+
+    decrypt().then(async (decrypted) => {
+      if (decrypted.startsWith("FILE:")) {
+        const parts = decrypted.split(":");
+        if (parts.length >= 5) {
+          const path = parts[1];
+          const ivB64 = parts[2];
+          const mime = parts[3];
+          const name = parts.slice(4).join(":");
+          
+          setFileName(name);
+          setText("Loading file...");
+          onResize && onResize();
+          
+          try {
+            const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
+            if (!res.ok) throw new Error("Fetch failed");
+            const encryptedBlob = await res.arrayBuffer();
+            
+            const keyEntry = chatKeys[chatId];
+            const key = await getAesKeyFromCode(keyEntry.code);
+            const plainBuffer = await crypto.subtle.decrypt(
+              { name: "AES-GCM", iv: new Uint8Array(base64ToBuf(ivB64)) },
+              key,
+              encryptedBlob
+            );
+            
+            const blob = new Blob([plainBuffer], { type: mime });
+            const url = URL.createObjectURL(blob);
+            setFileUrl(url);
+            if (mime.startsWith("image/")) setIsImage(true);
+            setText("");
+            loadedRef.current = true;
+            if (!mime.startsWith("image/")) onResize && onResize();
+          } catch (e) {
+            setText("Error loading file");
+            loadedRef.current = true;
+            onResize && onResize();
+          }
+        } else if (decrypted.startsWith("data:image")) {
+          setFileUrl(decrypted);
+          setIsImage(true);
+          setFileName("image.png");
+          setText("");
+          loadedRef.current = true;
+        } else {
+          setText(decrypted);
+          loadedRef.current = true;
+          onResize && onResize();
+        }
+      });
+    }, [msg.id, chatId, chatKeys, onResize]);
+
+    const isMe = msg.fromUserId === userId;
+
+    return (
+      <div className={`msg-row ${isMe ? 'me' : 'them'}`}>
+        <div className={`msg-bubble ${isMe ? 'me' : 'them'}`}>
+          {fileUrl ? (
+            isImage ? (
+              <img src={fileUrl} alt={fileName} className="msg-image" onLoad={onResize} />
+            ) : (
+              <a href={fileUrl} download={fileName} style={{color: isMe?'white':'black', textDecoration:'underline'}}>
+                📎 {fileName}
+              </a>
+            )
+          ) : (
+            text
+          )}
+        </div>
+      </div>
+    );
+  });
+
 function Modal({ title, onClose, children }) {
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
@@ -154,6 +253,13 @@ function App() {
   const fileInputRef = useRef(null);
   const chatMessagesRef = useRef(null);
   const lastPollRef = useRef(Date.now());
+
+  // Scroll to bottom helper
+  const scrollToBottom = useCallback(() => {
+    if (chatMessagesRef.current) {
+      chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
+    }
+  }, []);
 
   // Load Theme
   useEffect(() => {
@@ -309,10 +415,8 @@ function App() {
 
   // Scroll to bottom on chat change or new messages
   useEffect(() => {
-    if (chatMessagesRef.current) {
-      chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
-    }
-  }, [activeChatId, messages]);
+    scrollToBottom();
+  }, [activeChatId, messages, scrollToBottom]);
 
   // Admin Shortcut
   useEffect(() => {
@@ -496,94 +600,7 @@ function App() {
     return '#8e8e93';
   };
 
-  // Sub-components for rendering
-  const ChatMessage = ({ msg, chatId }) => {
-    const [text, setText] = useState("...");
-    const [fileUrl, setFileUrl] = useState(null);
-    const [isImage, setIsImage] = useState(false);
-    const [fileName, setFileName] = useState("");
-    const loadedRef = useRef(false); // Track if we've already loaded this message
-
-    useEffect(() => { 
-      // Prevent re-running if we already have a file URL or final text for this specific message ID
-      if (loadedRef.current) return;
-
-      decryptMessage(chatId, msg).then(async (decrypted) => {
-        if (decrypted.startsWith("FILE:")) {
-          // FILE:<path>:<iv>:<mime>:<name>
-          const parts = decrypted.split(":");
-          if (parts.length >= 5) {
-            const path = parts[1];
-            const ivB64 = parts[2];
-            const mime = parts[3];
-            const name = parts.slice(4).join(":");
-            
-            setFileName(name);
-            setText("Loading file...");
-            
-            try {
-              // Fetch encrypted file
-              const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
-              if (!res.ok) throw new Error("Fetch failed");
-              const encryptedBlob = await res.arrayBuffer();
-              
-              // Decrypt
-              const keyEntry = chatKeys[chatId];
-              const key = await getAesKeyFromCode(keyEntry.code);
-              const plainBuffer = await crypto.subtle.decrypt(
-                { name: "AES-GCM", iv: new Uint8Array(base64ToBuf(ivB64)) },
-                key,
-                encryptedBlob
-              );
-              
-              const blob = new Blob([plainBuffer], { type: mime });
-              const url = URL.createObjectURL(blob);
-              setFileUrl(url);
-              if (mime.startsWith("image/")) setIsImage(true);
-              setText("");
-              loadedRef.current = true;
-            } catch (e) {
-              setText("Error loading file");
-              loadedRef.current = true;
-            }
-          } else {
-            setText(decrypted);
-            loadedRef.current = true;
-          }
-        } else if (decrypted.startsWith("data:image")) {
-          // Handle base64 image data URI
-          setFileUrl(decrypted);
-          setIsImage(true);
-          setFileName("image.png"); // Default name for base64 images
-          setText("");
-          loadedRef.current = true;
-        } else {
-          setText(decrypted);
-          loadedRef.current = true;
-        }
-      }); 
-    }, [msg.id, chatId, chatKeys]); // Changed dependency from 'msg' to 'msg.id' to avoid re-runs on object reference change
-
-    const isMe = msg.fromUserId === user.id;
-
-    return (
-      <div className={`msg-row ${isMe ? 'me' : 'them'}`}>
-        <div className={`msg-bubble ${isMe ? 'me' : 'them'}`}>
-          {fileUrl ? (
-            isImage ? (
-              <img src={fileUrl} alt={fileName} className="msg-image" />
-            ) : (
-              <a href={fileUrl} download={fileName} style={{color: isMe?'white':'black', textDecoration:'underline'}}>
-                📎 {fileName}
-              </a>
-            )
-          ) : (
-            text
-          )}
-        </div>
-      </div>
-    );
-  };
+  // ChatMessage component moved outside App
 
   if (!user) return <AuthScreen onLogin={(u) => { setUser(u); loadChats(); }} />;
 
@@ -657,7 +674,7 @@ function App() {
             )}
           </div>
           <div id="chat-messages" ref={chatMessagesRef}>
-            {activeMsgs.map(m => <ChatMessage key={m.id} msg={m} chatId={activeChatId} />)}
+            {activeMsgs.map(m => <ChatMessage key={m.id} msg={m} chatId={activeChatId} onResize={scrollToBottom} userId={user.id} chatKeys={chatKeys} />)}
           </div>
           <div className="chat-input-row">
             <input type="file" ref={fileInputRef} style={{display:'none'}} onChange={handleFileUpload} />

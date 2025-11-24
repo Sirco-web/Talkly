@@ -701,9 +701,18 @@ app.post("/api/upload", requireAuth, async (req, res) => {
   const { content, ext } = req.body; // content is base64 encrypted data
   if (!content || !ext) return res.status(400).json({ error: "Missing content or extension" });
 
+  // Security: Sanitize extension to prevent path traversal
+  const safeExt = path.extname(ext).replace(/[^a-z0-9.]/gi, "");
+  if (!safeExt) return res.status(400).json({ error: "Invalid extension" });
+
+  // Security: Limit size (approx 50MB in base64 is ~37MB binary)
+  if (content.length > 70 * 1024 * 1024) { 
+    return res.status(413).json({ error: "File too large" });
+  }
+
   const userId = req.session.userId;
   const randomName = crypto.randomBytes(16).toString("hex");
-  const fileName = `${randomName}${ext}`;
+  const fileName = `${randomName}${safeExt}`;
   const filePath = `talky/uploads/${userId}/${fileName}`;
 
   const body = {
@@ -728,6 +737,11 @@ app.post("/api/upload", requireAuth, async (req, res) => {
 app.get("/api/file", requireAuth, async (req, res) => {
   const filePath = req.query.path;
   if (!filePath) return res.status(400).send("Missing path");
+
+  // Security: Prevent path traversal and restrict to uploads directory
+  if (filePath.includes("..") || !filePath.startsWith("talky/uploads/")) {
+    return res.status(403).send("Access denied");
+  }
 
   try {
     const file = await githubRequest(

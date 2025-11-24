@@ -19,6 +19,9 @@ if (!fetch) {
 
 const app = express();
 
+// Trust proxy is required to get the real IP if behind a reverse proxy (common in dev containers/cloud)
+app.set('trust proxy', true);
+
 const PORT = process.env.PORT || 3000;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER;
@@ -28,7 +31,7 @@ const DATA_PATH = process.env.DATA_PATH || "talky/data.json";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-me-admin-pass";
 
 // --- Presence System (In-Memory) ---
-const userPresence = {}; // { userId: { status: 'online'|'away', lastSeen: number } }
+const userPresence = {}; // { userId: { status: 'online'|'away', lastSeen: number, ip: string } }
 
 // Cleanup stale presence every 10 seconds
 setInterval(() => {
@@ -339,7 +342,8 @@ app.post("/api/admin/login", (req, res) => {
 // NEW: Presence Heartbeat
 app.post("/api/presence", requireAuth, (req, res) => {
   const { status } = req.body; // 'online' or 'away'
-  userPresence[req.session.userId] = { status, lastSeen: Date.now() };
+  const ip = req.ip || req.connection.remoteAddress;
+  userPresence[req.session.userId] = { status, lastSeen: Date.now(), ip };
   res.json({ ok: true });
 });
 
@@ -348,11 +352,23 @@ app.get("/api/presence", requireAuth, (req, res) => {
   res.json({ presence: userPresence });
 });
 
-// NEW: Get All Users (Network Discovery)
+// NEW: Get Local Network Users (Same IP Only)
 app.get("/api/users", requireAuth, async (req, res) => {
   const db = await loadDB();
-  // Return minimal info
-  const users = db.users.map(u => ({ id: u.id, username: u.username }));
+  const currentIp = req.ip || req.connection.remoteAddress;
+  
+  // Find online users with the same IP
+  const onlineLocalIds = Object.keys(userPresence).filter(uid => {
+    const p = userPresence[uid];
+    // Check if IP matches and it's not the current user
+    return p && p.ip === currentIp && uid !== req.session.userId;
+  });
+
+  // Return minimal info for these users
+  const users = db.users
+    .filter(u => onlineLocalIds.includes(u.id))
+    .map(u => ({ id: u.id, username: u.username }));
+    
   res.json({ users });
 });
 

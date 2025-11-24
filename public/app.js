@@ -659,7 +659,7 @@ function App() {
       {modals.network && (
         <Modal title="Network & Requests" onClose={() => setModals({ ...modals, network: false })}>
           <div className="auth-tabs" style={{marginBottom: '15px'}}>
-            <div className={`auth-tab ${networkTab==='users'?'active':''}`} onClick={()=>setNetworkTab('users')}>All Users</div>
+            <div className={`auth-tab ${networkTab==='users'?'active':''}`} onClick={()=>setNetworkTab('users')}>Local Network</div>
             <div className={`auth-tab ${networkTab==='requests'?'active':''}`} onClick={()=>setNetworkTab('requests')}>
               Requests {myRequests.length > 0 && `(${myRequests.length})`}
             </div>
@@ -667,6 +667,11 @@ function App() {
 
           {networkTab === 'users' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '300px', overflowY: 'auto' }}>
+              {networkUsers.length === 0 && (
+                <div style={{padding:'20px', textAlign:'center', color:'var(--text-muted)'}}>
+                  No other users found on this network (WiFi/IP).
+                </div>
+              )}
               {networkUsers.filter(u => u.id !== user.id).map(u => (
                 <div key={u.id} style={{ padding: '10px', background: 'var(--bg)', borderRadius: '10px', border: '1px solid var(--border-subtle)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
                   <div style={{display:'flex', alignItems:'center', gap:'10px'}}>

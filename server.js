@@ -331,7 +331,7 @@ async function saveDB(db) {
   return true;
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   if (!req.session || !req.session.userId) {
     return res.status(401).json({ error: "Not authenticated" });
   }
@@ -742,7 +742,8 @@ app.post("/api/upload", requireAuth, async (req, res) => {
   if (!content || !ext) return res.status(400).json({ error: "Missing content or extension" });
 
   // Security: Sanitize extension to prevent path traversal
-  const safeExt = path.extname(ext).replace(/[^a-z0-9.]/gi, "");
+  // Fix: path.extname('.png') returns '' (dotfile). Prepend char to ensure it's treated as extension.
+  const safeExt = path.extname(`x${ext}`).replace(/[^a-z0-9.]/gi, "");
   if (!safeExt) return res.status(400).json({ error: "Invalid extension" });
 
   // Security: Limit size (approx 50MB in base64 is ~37MB binary)
